@@ -9,64 +9,33 @@ permissions:
   contents: read
 
 jobs:
-  static-city-files:
+  app-loader:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - name: Checkout runner repository
         uses: actions/checkout@v4
 
-      - name: Fetch current city GeoJSON static files
+      - name: Fetch app loader and inspect data URLs
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p static_test
-          cat > static_test/run.sh <<'SH'
-          #!/usr/bin/env bash
-          set -u
-          fetch_one() {
-            key="$1"; url="$2"
-            code=$(curl -L --compressed --max-time 8 -A 'Mozilla/5.0 TeaMapStaticProbe/1.0' -sS -w '%{http_code}' -o "static_test/${key}.bin" "$url" || echo ERR)
-            size=$(wc -c < "static_test/${key}.bin" 2>/dev/null || echo 0)
-            ctype=$(file -b --mime-type "static_test/${key}.bin" 2>/dev/null || true)
-            printf '%s\t%s\t%s\t%s\n' "$key" "$code" "$size" "$ctype" > "static_test/${key}.meta"
-          }
-          fetch_one cq 'https://geojsoncn.com/%E5%B8%82/%E9%87%8D%E5%BA%86%E5%B8%82.json' &
-          fetch_one linzhi 'https://geojsoncn.com/%E5%B8%82/%E6%9E%97%E8%8A%9D%E5%B8%82.json' &
-          fetch_one shannan 'https://geojsoncn.com/%E5%B8%82/%E5%B1%B1%E5%8D%97%E5%B8%82.json' &
-          fetch_one hetian 'https://geojsoncn.com/%E5%B8%82/%E5%92%8C%E7%94%B0%E5%9C%B0%E5%8C%BA.json' &
-          fetch_one sansha 'https://geojsoncn.com/%E5%B8%82/%E4%B8%89%E6%B2%99%E5%B8%82.json' &
-          wait
-          cat static_test/*.meta
-          SH
-          bash static_test/run.sh
-          python - <<'PY'
-          import json,glob,os
-          targets={'cq':['500157'],'linzhi':['540481'],'shannan':['540581'],'hetian':['653228','653229'],'sansha':['460302','460303']}
-          out={}
-          for key,codes in targets.items():
-            p=f'static_test/{key}.bin'; rec={'bytes':os.path.getsize(p) if os.path.exists(p) else 0,'json':False,'matches':{}}
-            try:
-              obj=json.load(open(p,encoding='utf-8-sig')); rec['json']=True; rec['type']=obj.get('type'); fs=obj.get('features',[]); rec['feature_count']=len(fs)
-              for c in codes:
-                mm=[]
-                for i,f in enumerate(fs):
-                  pr=f.get('properties') or {}; vals=[str(pr.get(k,'')) for k in ['adcode','code','gb','gbCode']]
-                  if c in vals or ('156'+c) in vals: mm.append({'index':i,'properties':pr,'geometry_type':(f.get('geometry') or {}).get('type')})
-                rec['matches'][c]=mm
-            except Exception as e: rec['error']=repr(e); rec['prefix']=open(p,'rb').read(100).hex() if os.path.exists(p) else ''
-            out[key]=rec
-          open('static_test/summary.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
-          print(json.dumps(out,ensure_ascii=False,indent=2))
-          PY
+          mkdir -p app_probe
+          URL='https://geojsoncn.com/app.js?file=%E5%B8%82%2F%E9%87%8D%E5%BA%86%E5%B8%82.json'
+          code=$(curl -L --compressed --max-time 12 -A 'Mozilla/5.0 TeaMapAppProbe/1.0' -sS -w '%{http_code}' -o app_probe/app.js "$URL" || true)
+          echo "HTTP=$code BYTES=$(wc -c < app_probe/app.js 2>/dev/null || echo 0)"
+          if [ -s app_probe/app.js ]; then
+            grep -n -E 'fetch\(|XMLHttpRequest|axios|\.json|download|geojson|file=|DATA|mapData|api/' app_probe/app.js | head -n 200 || true
+            sed -n '1,220p' app_probe/app.js > app_probe/head.txt
+          fi
 
       - name: Package and upload
         shell: bash
-        run: tar -czf GEOJSONCN-STATIC-CITY-TEST-20260907.tar.gz static_test
+        run: tar -czf GEOJSONCN-APP-LOADER-20260907.tar.gz app_probe
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: GEOJSONCN-STATIC-CITY-TEST-20260907
-          path: GEOJSONCN-STATIC-CITY-TEST-20260907.tar.gz
+          name: GEOJSONCN-APP-LOADER-20260907
+          path: GEOJSONCN-APP-LOADER-20260907.tar.gz
           retention-days: 30
