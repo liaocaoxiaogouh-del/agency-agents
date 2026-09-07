@@ -1,109 +1,65 @@
 name: Tea Map Spatial QA
-
 on:
   push:
-    branches:
-      - tea-map-spatial-qa-20260907
-
+    branches: [tea-map-spatial-qa-20260907]
 permissions:
   contents: read
-
 jobs:
-  osm-gap-test:
+  hainan-standard-map-discovery:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Checkout runner repository
-        uses: actions/checkout@v4
-
-      - name: Install geometry validator
-        run: python -m pip install --disable-pip-version-check --quiet shapely
-
-      - name: Query Nominatim for seven current 98 gaps
+      - uses: actions/checkout@v4
+      - name: Discover Xisha/Nansha official standard-map links
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p osm_gap/raw osm_gap/normalized
+          mkdir -p hainan_standard_map
           python - <<'PY'
-          import csv,hashlib,json,time,urllib.parse,urllib.request
+          import json,re,urllib.parse,urllib.request
           from pathlib import Path
-          from shapely.geometry import shape
-          from shapely.validation import explain_validity
-
-          ROOT=Path('osm_gap'); RAW=ROOT/'raw'; NORM=ROOT/'normalized'
-          targets={
-            '500157':('两江新区','重庆市,中国'),
-            '540481':('米林市','林芝市,西藏自治区,中国'),
-            '540581':('错那市','山南市,西藏自治区,中国'),
-            '460302':('西沙区','三沙市,海南省,中国'),
-            '460303':('南沙区','三沙市,海南省,中国'),
-            '653228':('和康县','和田地区,新疆维吾尔自治区,中国'),
-            '653229':('和安县','和田地区,新疆维吾尔自治区,中国'),
-          }
-          UA='TeaMapSpatialQA/1.0 (project asset QA)'
-          def shab(b):return hashlib.sha256(b).hexdigest()
-          def can(o):return shab(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode())
-          def valid(g):
-            if not isinstance(g,dict):return False,'GEOM_MISSING'
-            if g.get('type') not in {'Polygon','MultiPolygon'}:return False,'GEOM_TYPE:'+str(g.get('type'))
-            try:
-              sg=shape(g)
-              if sg.is_empty:return False,'GEOM_EMPTY'
-              if not sg.is_valid:return False,'GEOM_INVALID:'+explain_validity(sg)
-            except Exception as e:return False,'GEOM_ERROR:'+repr(e)
-            return True,''
-          def search(code,name,context):
-            q=f'{name},{context}'
-            params={'format':'jsonv2','q':q,'polygon_geojson':'1','addressdetails':'1','extratags':'1','namedetails':'1','limit':'10','accept-language':'zh-CN,zh'}
-            url='https://nominatim.openstreetmap.org/search?'+urllib.parse.urlencode(params)
-            req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/json'})
-            with urllib.request.urlopen(req,timeout=30) as r:b=r.read()
-            (RAW/f'{code}.json').write_bytes(b)
-            return url,b,json.loads(b.decode('utf-8'))
-          rows=[]
-          for n,(code,(name,ctx)) in enumerate(targets.items()):
-            rec={'adcode':code,'expected_name':name,'query_context':ctx,'http_ok':'NO','result_count':0,'selected_osm_type':'','selected_osm_id':'','display_name':'','category':'','type':'','admin_level':'','geometry_type':'','geometry_valid':'NO','geometry_issue':'','geometry_sha256':'','raw_sha256':'','normalized_sha256':'','candidate_status':'NO_CANDIDATE','license':'ODbL 1.0; attribution required'}
-            try:
-              url,b,data=search(code,name,ctx);rec['http_ok']='YES';rec['raw_sha256']=shab(b);rec['result_count']=len(data)
-              cand=[]
-              for x in data:
-                nd=x.get('namedetails') or {}; addr=x.get('address') or {}; g=x.get('geojson')
-                names={str(x.get('name') or ''),str(nd.get('name:zh') or ''),str(nd.get('name') or '')}
-                # exact Chinese name preferred; administrative relation preferred; polygon required
-                name_hit=name in names or str(x.get('display_name') or '').startswith(name+',')
-                ok,why=valid(g)
-                admin_level=str((x.get('extratags') or {}).get('admin_level') or '')
-                score=(100 if name_hit else 0)+(20 if x.get('osm_type')=='relation' else 0)+(15 if x.get('category')=='boundary' else 0)+(10 if x.get('type')=='administrative' else 0)+(5 if admin_level in {'6','7','8'} else 0)+(30 if ok else 0)
-                cand.append((score,name_hit,ok,why,x))
-              cand.sort(key=lambda z:z[0],reverse=True)
-              if cand:
-                score,name_hit,ok,why,x=cand[0];g=x.get('geojson');rec.update({'selected_osm_type':str(x.get('osm_type') or ''),'selected_osm_id':str(x.get('osm_id') or ''),'display_name':str(x.get('display_name') or ''),'category':str(x.get('category') or ''),'type':str(x.get('type') or ''),'admin_level':str((x.get('extratags') or {}).get('admin_level') or ''),'geometry_type':str(g.get('type') if isinstance(g,dict) else ''),'geometry_valid':'YES' if ok else 'NO','geometry_issue':why,'geometry_sha256':can(g) if isinstance(g,dict) else ''})
-                if name_hit and ok and x.get('osm_type')=='relation':
-                  rec['candidate_status']='OSM_RELATION_CANDIDATE'
-                  out={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'asset_id':'ADM-'+code,'adcode':int(code),'name':name,'source_type':'OPENSTREETMAP_NOMINATIM_CANDIDATE','source_id':'SRC-OSM-NOMINATIM-20260907','osm_type':x.get('osm_type'),'osm_id':x.get('osm_id'),'display_name':x.get('display_name'),'category':x.get('category'),'osm_feature_type':x.get('type'),'admin_level':(x.get('extratags') or {}).get('admin_level'),'raw_query_sha256':rec['raw_sha256'],'geometry_sha256':rec['geometry_sha256'],'license':'OpenStreetMap contributors, ODbL 1.0','promotion_status':'PENDING_SOURCE_AND_ADMIN_IDENTITY_REVIEW'},'geometry':g}]}
-                  op=NORM/f'ADM-{code}.geojson';bb=json.dumps(out,ensure_ascii=False,separators=(',',':')).encode();op.write_bytes(bb);rec['normalized_sha256']=shab(bb)
-                elif not name_hit:rec['candidate_status']='TOP_RESULT_NAME_MISMATCH'
-                elif not ok:rec['candidate_status']='GEOM_FAIL'
-                else:rec['candidate_status']='NON_RELATION_RESULT'
+          OUT=Path('hainan_standard_map')
+          UA={'User-Agent':'Mozilla/5.0 TeaMapOfficialMapDiscovery/1.0','Accept-Encoding':'identity'}
+          seeds=['https://hism.mnr.gov.cn/sjkf/hndt/']
+          seen=set(); queue=list(seeds); hits=[]; pages=[]
+          def get(u):
+            req=urllib.request.Request(u,headers=UA)
+            with urllib.request.urlopen(req,timeout=15) as r:return r.geturl(),r.headers.get('Content-Type',''),r.read()
+          while queue and len(seen)<80:
+            u=queue.pop(0)
+            if u in seen: continue
+            seen.add(u)
+            try: final,ct,b=get(u)
             except Exception as e:
-              rec['geometry_issue']='REQUEST_ERROR:'+repr(e);rec['candidate_status']='REQUEST_FAIL'
-            rows.append(rec)
-            time.sleep(1.1)
-          with open(ROOT/'results.csv','w',encoding='utf-8-sig',newline='') as f:
-            w=csv.DictWriter(f,fieldnames=list(rows[0].keys()));w.writeheader();w.writerows(rows)
-          summary={'target_count':len(rows),'candidate_count':sum(r['candidate_status']=='OSM_RELATION_CANDIDATE' for r in rows),'candidate_codes':[r['adcode'] for r in rows if r['candidate_status']=='OSM_RELATION_CANDIDATE'],'unresolved_codes':[r['adcode'] for r in rows if r['candidate_status']!='OSM_RELATION_CANDIDATE'],'policy':'OSM is fallback candidate only. No geometry repair. ODbL attribution/licensing applies. South China Sea candidates must not override national-standard map compliance assets.'}
-          (ROOT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('=== OSM_GAP_SUMMARY ===');print(json.dumps(summary,ensure_ascii=False,indent=2));print('=== END ===')
-          for r in rows:print(json.dumps(r,ensure_ascii=False))
+              pages.append({'url':u,'error':repr(e)}); continue
+            pages.append({'url':u,'final':final,'ct':ct,'bytes':len(b)})
+            text=b.decode('utf-8','replace') if ('text' in ct.lower() or 'html' in ct.lower() or u.endswith(('.html','.htm','/'))) else ''
+            if text:
+              fn=OUT/f'page_{len(pages):03d}.html'; fn.write_text(text,encoding='utf-8')
+              if '西沙' in text or '南沙' in text or '三沙' in text:
+                for m in re.finditer(r'.{0,250}(?:西沙|南沙|三沙).{0,700}',text,re.S): hits.append({'page':final,'snippet':m.group(0)[:1200]})
+              for href in re.findall(r'(?:href|src)=["\']([^"\']+)',text,re.I):
+                v=urllib.parse.urljoin(final,href)
+                if v.startswith('http') and ('hism.mnr.gov.cn' in urllib.parse.urlparse(v).netloc):
+                  if any(x in v.lower() for x in ['hndt','2024','2025','sansha','xisha','nansha','download','file','jpg','eps','html','htm']):
+                    if v not in seen and len(queue)<100: queue.append(v)
+                if any(s in href.lower() for s in ['.eps','.jpg','.jpeg','.pdf']) and any(n in text for n in ['西沙','南沙','三沙']):
+                  hits.append({'page':final,'asset':v})
+          # collect direct asset-looking URLs found in all saved text
+          assets=[]
+          for p in OUT.glob('page_*.html'):
+            t=p.read_text(encoding='utf-8')
+            for x in re.findall(r'[^"\'<> ]+\.(?:eps|jpg|jpeg|pdf)(?:\?[^"\'<> ]*)?',t,re.I):
+              assets.append(x)
+          result={'visited':pages,'hits':hits[:300],'assets':assets[:500]}
+          (OUT/'discovery.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('visited',len(pages),'hits',len(hits),'assets',len(assets))
+          for h in hits[:100]: print('HIT',json.dumps(h,ensure_ascii=False)[:2000])
           PY
-
       - name: Package
-        shell: bash
-        run: tar -czf OSM-CURRENT98-GAP-TEST-20260907.tar.gz osm_gap
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
+        run: tar -czf HAINAN-OFFICIAL-STANDARD-MAP-DISCOVERY-20260907.tar.gz hainan_standard_map
+      - uses: actions/upload-artifact@v4
         with:
-          name: OSM-CURRENT98-GAP-TEST-20260907
-          path: OSM-CURRENT98-GAP-TEST-20260907.tar.gz
+          name: HAINAN-OFFICIAL-STANDARD-MAP-DISCOVERY-20260907
+          path: HAINAN-OFFICIAL-STANDARD-MAP-DISCOVERY-20260907.tar.gz
           retention-days: 30
