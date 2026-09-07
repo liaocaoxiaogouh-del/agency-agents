@@ -9,33 +9,114 @@ permissions:
   contents: read
 
 jobs:
-  app-loader:
+  current-mapjson-gap:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout runner repository
         uses: actions/checkout@v4
 
-      - name: Fetch app loader and inspect data URLs
+      - name: Install geometry validator
+        run: python -m pip install --disable-pip-version-check --quiet shapely
+
+      - name: Fetch current mapjson files and QA target features
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p app_probe
-          URL='https://geojsoncn.com/app.js?file=%E5%B8%82%2F%E9%87%8D%E5%BA%86%E5%B8%82.json'
-          code=$(curl -L --compressed --max-time 12 -A 'Mozilla/5.0 TeaMapAppProbe/1.0' -sS -w '%{http_code}' -o app_probe/app.js "$URL" || true)
-          echo "HTTP=$code BYTES=$(wc -c < app_probe/app.js 2>/dev/null || echo 0)"
-          if [ -s app_probe/app.js ]; then
-            grep -n -E 'fetch\(|XMLHttpRequest|axios|\.json|download|geojson|file=|DATA|mapData|api/' app_probe/app.js | head -n 200 || true
-            sed -n '1,220p' app_probe/app.js > app_probe/head.txt
-          fi
+          mkdir -p current_mapjson/raw current_mapjson/normalized
+          cat > current_mapjson/fetch.sh <<'SH'
+          #!/usr/bin/env bash
+          set -u
+          fetch_one(){
+            key="$1"; url="$2"
+            code=$(curl -L --compressed --max-time 15 -A 'Mozilla/5.0 TeaMapCurrentMapjson/1.0' -sS -w '%{http_code}' -o "current_mapjson/raw/${key}.json" "$url" || echo ERR)
+            printf '%s\t%s\t%s\n' "$key" "$code" "$(wc -c < current_mapjson/raw/${key}.json 2>/dev/null || echo 0)" > "current_mapjson/${key}.meta"
+          }
+          fetch_one cq 'https://geojsoncn.com/mapjson/%E5%B8%82/%E9%87%8D%E5%BA%86%E5%B8%82.json' &
+          fetch_one linzhi 'https://geojsoncn.com/mapjson/%E5%B8%82/%E6%9E%97%E8%8A%9D%E5%B8%82.json' &
+          fetch_one shannan 'https://geojsoncn.com/mapjson/%E5%B8%82/%E5%B1%B1%E5%8D%97%E5%B8%82.json' &
+          fetch_one hetian 'https://geojsoncn.com/mapjson/%E5%B8%82/%E5%92%8C%E7%94%B0%E5%9C%B0%E5%8C%BA.json' &
+          fetch_one sansha 'https://geojsoncn.com/mapjson/%E5%B8%82/%E4%B8%89%E6%B2%99%E5%B8%82.json' &
+          wait
+          cat current_mapjson/*.meta
+          SH
+          bash current_mapjson/fetch.sh
+          python - <<'PY'
+          import csv,hashlib,json,os
+          from pathlib import Path
+          from shapely.geometry import shape
+          from shapely.validation import explain_validity
+
+          ROOT=Path('current_mapjson'); RAW=ROOT/'raw'; NORM=ROOT/'normalized'
+          targets={
+            'cq':{'500157':'两江新区'},
+            'linzhi':{'540481':'米林市'},
+            'shannan':{'540581':'错那市'},
+            'hetian':{'653228':'和康县','653229':'和安县'},
+            'sansha':{'460302':'西沙区','460303':'南沙区'},
+          }
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          def can(o):return sha(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode())
+          def valid(g):
+            if not isinstance(g,dict):return False,'GEOM_MISSING'
+            if g.get('type') not in {'Polygon','MultiPolygon'}:return False,'GEOM_TYPE:'+str(g.get('type'))
+            if not g.get('coordinates'):return False,'GEOM_EMPTY'
+            try:
+              sg=shape(g)
+              if sg.is_empty:return False,'GEOM_EMPTY'
+              if not sg.is_valid:return False,'GEOM_INVALID:'+explain_validity(sg)
+            except Exception as e:return False,'GEOM_ERROR:'+repr(e)
+            return True,''
+          def code_of(pr):
+            for k in ['adcode','code','gb','gbCode']:
+              v=pr.get(k)
+              if v is None:continue
+              s=''.join(x for x in str(v) if x.isdigit())
+              if len(s)==6:return s
+              if len(s)>=9:return s[-6:]
+            return None
+          rows=[]; file_stats={}
+          for key,expected in targets.items():
+            p=RAW/f'{key}.json'; b=p.read_bytes() if p.exists() else b''
+            stat={'key':key,'bytes':len(b),'sha256':sha(b) if b else '', 'json':False,'feature_count':0}
+            idx={}
+            try:
+              o=json.loads(b.decode('utf-8-sig'));stat['json']=True;fs=o.get('features',[]) if isinstance(o,dict) else [];stat['feature_count']=len(fs)
+              for i,f in enumerate(fs):
+                pr=f.get('properties') or {}; c=code_of(pr)
+                if c: idx.setdefault(c,[]).append((i,f))
+            except Exception as e: stat['error']=repr(e)
+            file_stats[key]=stat
+            for c,name in expected.items():
+              rec={'adcode':c,'expected_name':name,'source_key':key,'source_sha256':stat['sha256'],'source_feature_count':stat['feature_count'],'present':'NO','actual_name':'','code_match':'NO','name_match':'NO','geometry_type':'','geometry_valid':'NO','geometry_issue':'','geometry_sha256':'','normalized_sha256':'','candidate_status':'FAIL'}
+              mm=idx.get(c,[])
+              if len(mm)==1:
+                i,f=mm[0];pr=f.get('properties') or {};g=f.get('geometry');ok,why=valid(g)
+                rec.update({'present':'YES','actual_name':str(pr.get('name') or ''),'code_match':'YES','name_match':'YES' if str(pr.get('name') or '')==name else 'NO','geometry_type':str(g.get('type') if isinstance(g,dict) else ''),'geometry_valid':'YES' if ok else 'NO','geometry_issue':why,'geometry_sha256':can(g) if isinstance(g,dict) else ''})
+                if rec['name_match']=='YES' and ok:
+                  norm={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'asset_id':'ADM-'+c,'adcode':int(c),'name':name,'source_type':'GEOJSONCN_CURRENT_MAPJSON_CANDIDATE','source_id':'SRC-GEOJSONCN-CURRENT-MAPJSON-20260907','source_url':'https://geojsoncn.com/mapjson/','source_group':key,'source_file_sha256':stat['sha256'],'geometry_sha256':rec['geometry_sha256'],'default_role':'CURRENT98_GAP_CANDIDATE','original_properties':pr},'geometry':g}]}
+                  op=NORM/f'ADM-{c}.geojson';txt=json.dumps(norm,ensure_ascii=False,separators=(',',':')).encode();op.write_bytes(txt);rec['normalized_sha256']=sha(txt);rec['candidate_status']='PASS'
+                elif rec['name_match']!='YES': rec['geometry_issue']='NAME_MISMATCH'
+              elif len(mm)>1:
+                rec['present']='MULTIPLE';rec['geometry_issue']='DUPLICATE_CODE_IN_SOURCE'
+              else:
+                rec['geometry_issue']='CODE_NOT_PRESENT'
+              rows.append(rec)
+          with open(ROOT/'target_results.csv','w',encoding='utf-8-sig',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=list(rows[0].keys()));w.writeheader();w.writerows(rows)
+          summary={'source':'geojsoncn.com current mapjson public preview','file_stats':file_stats,'target_count':len(rows),'pass_count':sum(r['candidate_status']=='PASS' for r in rows),'fail_count':sum(r['candidate_status']!='PASS' for r in rows),'pass_codes':[r['adcode'] for r in rows if r['candidate_status']=='PASS'],'fail_codes':[r['adcode'] for r in rows if r['candidate_status']!='PASS'],'policy':'QA candidate only; no geometry repair. Publication/use rights remain separately reviewable.'}
+          (ROOT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          for r in rows:print(json.dumps(r,ensure_ascii=False))
+          PY
 
       - name: Package and upload
         shell: bash
-        run: tar -czf GEOJSONCN-APP-LOADER-20260907.tar.gz app_probe
+        run: tar -czf GEOJSONCN-CURRENT-MAPJSON-GAP-20260907.tar.gz current_mapjson
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: GEOJSONCN-APP-LOADER-20260907
-          path: GEOJSONCN-APP-LOADER-20260907.tar.gz
+          name: GEOJSONCN-CURRENT-MAPJSON-GAP-20260907
+          path: GEOJSONCN-CURRENT-MAPJSON-GAP-20260907.tar.gz
           retention-days: 30
