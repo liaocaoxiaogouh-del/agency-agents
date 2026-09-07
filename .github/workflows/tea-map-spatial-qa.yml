@@ -11,7 +11,7 @@ permissions:
 jobs:
   qa:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Checkout runner repository
         uses: actions/checkout@v4
@@ -27,411 +27,222 @@ jobs:
       - name: Install geometry validator
         run: python -m pip install --disable-pip-version-check --quiet shapely
 
-      - name: Acquire direct DataV base assets and run nationwide QA
+      - name: Build combined nationwide DEFAULT candidate and QA
         shell: bash
         run: |
           set -euo pipefail
-          cat > tea_map_spatial_qa_v2.py <<'PY'
+          cat > tea_map_spatial_qa_v3.py <<'PY'
           import csv
           import hashlib
           import json
           import math
           import time
           import urllib.request
-          import urllib.error
           from collections import Counter
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from pathlib import Path
 
-          from shapely.geometry import Point, shape
+          from shapely.geometry import shape
           from shapely.validation import explain_validity
 
-          REFERENCE_COMMIT = "7aa2c5fabc6a892015625898c3482874b233f9de"
-          REFERENCE_INFO = Path("reference_repo/info.json")
+          COMMIT = "7aa2c5fabc6a892015625898c3482874b233f9de"
           BASE_URL = "https://geo.datav.aliyun.com/areas_v3/bound/"
-          CURRENT_INFO_URL = BASE_URL + "infos.json"
-          SOURCE_ID = "SRC-DATAV-V3-DIRECT-SNAPSHOT-20260907"
-          BATCH_ID = "QA-20260907-DATAV-V3-DIRECT-ADM-DEFAULT-CANDIDATE"
-          RAW = Path("raw_direct")
+          REPO = Path("reference_repo")
+          RAW_DIRECT = Path("raw_direct_delta")
+          QA = Path("qa_v3")
           NORM = Path("normalized_pass")
-          QA = Path("qa_v2")
-          for p in (RAW, NORM, QA):
-              p.mkdir(parents=True, exist_ok=True)
+          for p in (RAW_DIRECT, QA, NORM): p.mkdir(parents=True, exist_ok=True)
 
-          def sha256_bytes(data):
-              return hashlib.sha256(data).hexdigest()
-
-          def sha256_file(path):
-              h = hashlib.sha256()
-              with open(path, "rb") as f:
-                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                      h.update(chunk)
+          def sha256_bytes(b): return hashlib.sha256(b).hexdigest()
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,"rb") as f:
+                  for c in iter(lambda:f.read(1024*1024),b""): h.update(c)
               return h.hexdigest()
+          def canonical_hash(o): return sha256_bytes(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8"))
 
-          def canonical_hash(obj):
-              return sha256_bytes(json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+          info=json.load(open(REPO/"info.json",encoding="utf-8"))
+          expected={}
+          for code,rec in info.items():
+              if not isinstance(rec,dict) or rec.get("adcode") is None: continue
+              par=rec.get("parent") or {}
+              expected[str(code)]={
+                  "adcode":str(code),"name":rec.get("name"),"level":rec.get("level"),
+                  "parent_adcode":None if par.get("adcode") is None else str(par.get("adcode")),
+              }
+          subnational={c:r for c,r in expected.items() if r["level"] in {"province","city","district"}}
+          expected_counts=Counter(r["level"] for r in subnational.values())
 
-          def http_get_bytes(url, retries=4, timeout=25):
-              last = None
-              headers = {"User-Agent": "Mozilla/5.0 TeaMapSpatialQA/1.0"}
-              for attempt in range(retries):
+          # Index all single-self district files preserved by the locked repository snapshot.
+          repo_district={}
+          collision_rows=[]
+          for folder in [REPO/"county", REPO/"citys"]:
+              for p in sorted(folder.glob("*.json")):
+                  try: obj=json.load(open(p,encoding="utf-8-sig"))
+                  except Exception: continue
+                  feats=obj.get("features",[]) if isinstance(obj,dict) else []
+                  if len(feats)!=1: continue
+                  props=feats[0].get("properties") or {}
+                  code=str(props.get("adcode"))
+                  if code in subnational and subnational[code]["level"]=="district" and props.get("level")=="district":
+                      if code in repo_district:
+                          collision_rows.append({"adcode":code,"first":str(repo_district[code].relative_to(REPO)),"second":str(p.relative_to(REPO))})
+                      else:
+                          repo_district[code]=p
+
+          missing_district=sorted(c for c,r in subnational.items() if r["level"]=="district" and c not in repo_district)
+          direct_targets=sorted(c for c,r in subnational.items() if r["level"] in {"province","city"}) + missing_district
+          direct_targets=sorted(set(direct_targets))
+
+          def http_get(url,retries=3,timeout=12):
+              last=None
+              for i in range(retries):
                   try:
-                      req = urllib.request.Request(url, headers=headers)
-                      with urllib.request.urlopen(req, timeout=timeout) as r:
-                          if getattr(r, "status", 200) != 200:
-                              raise RuntimeError(f"HTTP {getattr(r, 'status', None)}")
-                          return r.read()
+                      req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 TeaMapSpatialQA/1.0"})
+                      with urllib.request.urlopen(req,timeout=timeout) as resp:
+                          return resp.read()
                   except Exception as e:
-                      last = e
-                      time.sleep(0.35 * (attempt + 1))
+                      last=e; time.sleep(0.25*(i+1))
               raise last
 
-          reference = json.load(open(REFERENCE_INFO, encoding="utf-8"))
-          expected = {}
-          for code, rec in reference.items():
-              code = str(code)
-              if not isinstance(rec, dict) or rec.get("adcode") is None:
-                  continue
-              parent = rec.get("parent") or {}
-              expected[code] = {
-                  "adcode": code,
-                  "name": rec.get("name"),
-                  "level": rec.get("level"),
-                  "parent_adcode": None if parent.get("adcode") is None else str(parent.get("adcode")),
-                  "center": rec.get("center"),
-                  "centroid": rec.get("centroid"),
-              }
-
-          expected_counts = Counter(v["level"] for v in expected.values())
-          subnational_codes = sorted(c for c, v in expected.items() if v["level"] in {"province", "city", "district"})
-
-          # Archive current DataV metadata independently, then compare with locked reference metadata.
-          current_info_error = None
-          current_info = None
-          try:
-              b = http_get_bytes(CURRENT_INFO_URL)
-              (RAW / "infos_current.json").write_bytes(b)
-              current_info = json.loads(b.decode("utf-8"))
-          except Exception as e:
-              current_info_error = repr(e)
-
-          drift_rows = []
-          if isinstance(current_info, dict):
-              current_codes = set(map(str, current_info.keys()))
-              reference_codes = set(expected.keys())
-              for code in sorted(reference_codes | current_codes):
-                  r = expected.get(code)
-                  c = current_info.get(code) or current_info.get(int(code)) if code.isdigit() else current_info.get(code)
-                  if isinstance(c, dict):
-                      cp = c.get("parent") or {}
-                      cm = (c.get("name"), c.get("level"), None if cp.get("adcode") is None else str(cp.get("adcode")))
-                  else:
-                      cm = None
-                  if r:
-                      rm = (r.get("name"), r.get("level"), r.get("parent_adcode"))
-                  else:
-                      rm = None
-                  if rm != cm:
-                      drift_rows.append({"adcode": code, "reference": json.dumps(rm, ensure_ascii=False), "current": json.dumps(cm, ensure_ascii=False)})
-
-          download_rows = []
-
           def acquire(code):
-              url = BASE_URL + code + ".json"
-              p = RAW / f"{code}.json"
+              url=BASE_URL+code+".json"; p=RAW_DIRECT/(code+".json")
               try:
-                  data = http_get_bytes(url)
-                  p.write_bytes(data)
-                  return {"adcode": code, "status": "OK", "bytes": len(data), "sha256": sha256_bytes(data), "url": url, "error": ""}
+                  b=http_get(url); p.write_bytes(b)
+                  return {"adcode":code,"status":"OK","bytes":len(b),"sha256":sha256_bytes(b),"url":url,"error":""}
               except Exception as e:
-                  return {"adcode": code, "status": "FAIL", "bytes": 0, "sha256": "", "url": url, "error": repr(e)}
+                  return {"adcode":code,"status":"FAIL","bytes":0,"sha256":"","url":url,"error":repr(e)}
 
-          # Include country file only as archived reference; it is never a production DEFAULT asset.
-          all_download_codes = ["100000"] + subnational_codes
-          with ThreadPoolExecutor(max_workers=12) as ex:
-              futs = {ex.submit(acquire, code): code for code in all_download_codes}
-              for i, fut in enumerate(as_completed(futs), 1):
-                  row = fut.result()
-                  download_rows.append(row)
-                  if i % 250 == 0 or i == len(all_download_codes):
-                      ok = sum(r["status"] == "OK" for r in download_rows)
-                      print(f"download {i}/{len(all_download_codes)} ok={ok}")
+          download_rows=[]
+          with ThreadPoolExecutor(max_workers=10) as ex:
+              futs=[ex.submit(acquire,c) for c in direct_targets]
+              for i,f in enumerate(as_completed(futs),1):
+                  download_rows.append(f.result())
+                  if i%100==0 or i==len(futs):
+                      print(f"direct download {i}/{len(futs)} ok={sum(x['status']=='OK' for x in download_rows)}")
+          dmap={r["adcode"]:r for r in download_rows}
 
-          download_by_code = {r["adcode"]: r for r in download_rows}
-          qa_details = []
-          asset_rows = []
-          pass_geoms = {}
-
-          def add_detail(code, name, severity, issue_code, message):
-              qa_details.append({
-                  "adcode": code,
-                  "name": name or "",
-                  "severity": severity,
-                  "issue_code": issue_code,
-                  "message": message,
-              })
-
-          def iter_numbers(coords):
-              if isinstance(coords, (list, tuple)):
-                  if len(coords) >= 2 and isinstance(coords[0], (int, float)) and isinstance(coords[1], (int, float)):
-                      yield coords[0], coords[1]
+          details=[]; rows=[]
+          def add(code,name,sev,issue,msg): details.append({"adcode":code,"name":name or "","severity":sev,"issue_code":issue,"message":msg})
+          def iter_xy(c):
+              if isinstance(c,(list,tuple)):
+                  if len(c)>=2 and isinstance(c[0],(int,float)) and isinstance(c[1],(int,float)): yield c[0],c[1]
                   else:
-                      for x in coords:
-                          yield from iter_numbers(x)
+                      for z in c: yield from iter_xy(z)
 
-          for code in subnational_codes:
-              meta = expected[code]
-              name = meta["name"]
-              hard = []
-              warns = []
-              drow = download_by_code.get(code)
-              feature = None
-              geom = None
-              source_sha = drow.get("sha256", "") if drow else ""
-              source_bytes = drow.get("bytes", 0) if drow else 0
-
-              if not drow or drow["status"] != "OK":
-                  hard.append(("DOWNLOAD_FAIL", drow.get("error", "missing download result") if drow else "missing download result"))
+          for code in sorted(subnational):
+              meta=subnational[code]; name=meta["name"]; hard=[]
+              if meta["level"]=="district" and code in repo_district:
+                  src_path=repo_district[code]; source_type="GITHUB_LOCKED_SNAPSHOT"; source_id="SRC-GITHUB-DATAV-CHINAGEOJSON"; source_url="https://github.com/zhChuXiao/ChinaGeoJson/tree/"+COMMIT+"/"+str(src_path.relative_to(REPO))
               else:
-                  p = RAW / f"{code}.json"
-                  try:
-                      obj = json.loads(p.read_text(encoding="utf-8-sig"))
-                  except Exception as e:
-                      obj = None
-                      hard.append(("JSON_PARSE", repr(e)))
-                  if isinstance(obj, dict):
-                      feats = obj.get("features")
-                      if obj.get("type") != "FeatureCollection" or not isinstance(feats, list) or not feats:
-                          hard.append(("NOT_FEATURE_COLLECTION", "expected non-empty FeatureCollection"))
-                      else:
-                          matches = [f for f in feats if str((f.get("properties") or {}).get("adcode")) == code]
-                          if len(matches) == 1:
-                              feature = matches[0]
-                          elif len(feats) == 1:
-                              feature = feats[0]
-                              hard.append(("ADCODE_RESPONSE_MISMATCH", f"response adcode={(feature.get('properties') or {}).get('adcode')}"))
-                          elif len(matches) == 0:
-                              hard.append(("ADCODE_NOT_FOUND_IN_RESPONSE", f"feature_count={len(feats)}"))
-                          else:
-                              hard.append(("DUPLICATE_ADCODE_IN_RESPONSE", f"matching_feature_count={len(matches)}"))
-
-              if feature is not None:
-                  props = feature.get("properties") or {}
-                  actual_name = props.get("name")
-                  actual_level = props.get("level")
-                  par = props.get("parent") or {}
-                  actual_parent = None if par.get("adcode") is None else str(par.get("adcode"))
-                  if str(props.get("adcode")) != code:
-                      hard.append(("ADCODE_MISMATCH", f"actual={props.get('adcode')}"))
-                  if actual_name != name:
-                      hard.append(("NAME_MISMATCH", f"expected={name}; actual={actual_name}"))
-                  if actual_level != meta["level"]:
-                      hard.append(("LEVEL_MISMATCH", f"expected={meta['level']}; actual={actual_level}"))
-                  if actual_parent != meta["parent_adcode"]:
-                      hard.append(("PARENT_MISMATCH", f"expected={meta['parent_adcode']}; actual={actual_parent}"))
-
-                  geom = feature.get("geometry")
-                  if not isinstance(geom, dict):
-                      hard.append(("GEOM_MISSING", "geometry missing"))
+                  src_path=RAW_DIRECT/(code+".json"); source_type="DATAV_DIRECT"; source_id="SRC-DATAV-V3-DIRECT-SNAPSHOT-20260907"; source_url=BASE_URL+code+".json"
+                  if not dmap.get(code) or dmap[code]["status"]!="OK": hard.append(("DOWNLOAD_FAIL",dmap.get(code,{}).get("error","missing result")))
+              obj=None; feature=None; geom=None
+              if not hard:
+                  try: obj=json.load(open(src_path,encoding="utf-8-sig"))
+                  except Exception as e: hard.append(("JSON_PARSE",repr(e)))
+              if isinstance(obj,dict):
+                  feats=obj.get("features")
+                  if obj.get("type")!="FeatureCollection" or not isinstance(feats,list) or not feats:
+                      hard.append(("NOT_FEATURE_COLLECTION","expected non-empty FeatureCollection"))
                   else:
-                      gtype = geom.get("type")
-                      if gtype not in {"Polygon", "MultiPolygon"}:
-                          hard.append(("GEOM_TYPE", f"actual={gtype}"))
-                      coords = geom.get("coordinates")
-                      if not coords:
-                          hard.append(("GEOM_EMPTY", "coordinates empty"))
+                      matches=[f for f in feats if str((f.get("properties") or {}).get("adcode"))==code]
+                      if len(matches)==1: feature=matches[0]
+                      elif len(feats)==1:
+                          feature=feats[0]; hard.append(("ADCODE_RESPONSE_MISMATCH",f"actual={(feature.get('properties') or {}).get('adcode')}"))
+                      elif not matches: hard.append(("ADCODE_NOT_FOUND_IN_RESPONSE",f"feature_count={len(feats)}"))
+                      else: hard.append(("DUPLICATE_ADCODE_IN_RESPONSE",f"matches={len(matches)}"))
+              if feature is not None:
+                  props=feature.get("properties") or {}; par=props.get("parent") or {}; actual_parent=None if par.get("adcode") is None else str(par.get("adcode"))
+                  if str(props.get("adcode"))!=code: hard.append(("ADCODE_MISMATCH",f"actual={props.get('adcode')}"))
+                  if props.get("name")!=name: hard.append(("NAME_MISMATCH",f"expected={name}; actual={props.get('name')}"))
+                  if props.get("level")!=meta["level"]: hard.append(("LEVEL_MISMATCH",f"expected={meta['level']}; actual={props.get('level')}"))
+                  if actual_parent!=meta["parent_adcode"]: hard.append(("PARENT_MISMATCH",f"expected={meta['parent_adcode']}; actual={actual_parent}"))
+                  geom=feature.get("geometry")
+                  if not isinstance(geom,dict): hard.append(("GEOM_MISSING","geometry missing"))
+                  else:
+                      if geom.get("type") not in {"Polygon","MultiPolygon"}: hard.append(("GEOM_TYPE",f"actual={geom.get('type')}"))
+                      coords=geom.get("coordinates")
+                      if not coords: hard.append(("GEOM_EMPTY","coordinates empty"))
                       else:
-                          points = 0
-                          bad_range = 0
-                          nonfinite = 0
-                          for lon, lat in iter_numbers(coords):
-                              points += 1
-                              if not (math.isfinite(lon) and math.isfinite(lat)):
-                                  nonfinite += 1
-                              elif not (-180 <= lon <= 180 and -90 <= lat <= 90):
-                                  bad_range += 1
-                          if points == 0:
-                              hard.append(("GEOM_NO_POINTS", "no coordinate pairs"))
-                          if nonfinite:
-                              hard.append(("GEOM_NONFINITE", f"count={nonfinite}"))
-                          if bad_range:
-                              hard.append(("GEOM_RANGE", f"count={bad_range}"))
+                          n=bad=nonfinite=0
+                          for lon,lat in iter_xy(coords):
+                              n+=1
+                              if not(math.isfinite(lon) and math.isfinite(lat)): nonfinite+=1
+                              elif not(-180<=lon<=180 and -90<=lat<=90): bad+=1
+                          if n==0: hard.append(("GEOM_NO_POINTS","no coordinate pairs"))
+                          if nonfinite: hard.append(("GEOM_NONFINITE",f"count={nonfinite}"))
+                          if bad: hard.append(("GEOM_RANGE",f"count={bad}"))
                           try:
-                              sg = shape(geom)
-                              if sg.is_empty:
-                                  hard.append(("GEOM_SHAPELY_EMPTY", "empty geometry"))
-                              if not sg.is_valid:
-                                  hard.append(("GEOM_INVALID", explain_validity(sg)))
-                          except Exception as e:
-                              hard.append(("GEOM_SHAPELY_ERROR", repr(e)))
+                              sg=shape(geom)
+                              if sg.is_empty: hard.append(("GEOM_SHAPELY_EMPTY","empty geometry"))
+                              if not sg.is_valid: hard.append(("GEOM_INVALID",explain_validity(sg)))
+                          except Exception as e: hard.append(("GEOM_SHAPELY_ERROR",repr(e)))
+              for issue,msg in hard: add(code,name,"FAIL",issue,msg)
+              status="PASS" if not hard else "FAIL"
+              source_sha=sha256_file(src_path) if src_path.exists() else ""
+              row={"asset_id":"ADM-"+code,"adcode":code,"name":name,"level":meta["level"],"parent_adcode":meta["parent_adcode"] or "","qa_status":status,"hard_issue_count":len(hard),"source_type":source_type,"source_id":source_id,"source_url":source_url,"source_sha256":source_sha,"geometry_sha256":canonical_hash(geom) if isinstance(geom,dict) else "","geometry_type":geom.get("type") if isinstance(geom,dict) else "","normalized_sha256":""}
+              if status=="PASS":
+                  norm={"type":"FeatureCollection","features":[{"type":"Feature","properties":{"asset_id":"ADM-"+code,"adcode":int(code),"name":name,"level":meta["level"],"parent_adcode":int(meta["parent_adcode"]) if meta["parent_adcode"] and meta["parent_adcode"].isdigit() else meta["parent_adcode"],"source_type":source_type,"source_id":source_id,"source_url":source_url,"source_sha256":source_sha,"geometry_sha256":canonical_hash(geom),"reference_commit":COMMIT,"default_role":"ACTIVE_DEFAULT_CANDIDATE","original_properties":feature.get("properties") or {}},"geometry":geom}]}
+                  out=NORM/("ADM-"+code+".geojson"); out.write_text(json.dumps(norm,ensure_ascii=False,separators=(",",":")),encoding="utf-8"); row["normalized_sha256"]=sha256_file(out)
+              rows.append(row)
 
-              for issue_code, msg in hard:
-                  add_detail(code, name, "FAIL", issue_code, msg)
-              for issue_code, msg in warns:
-                  add_detail(code, name, "WARN", issue_code, msg)
+          fields=["asset_id","adcode","name","level","parent_adcode","qa_status","hard_issue_count","source_type","source_id","source_url","source_sha256","geometry_sha256","geometry_type","normalized_sha256"]
+          for fn,data in [("asset_index.csv",rows),("lock_manifest.csv",[r for r in rows if r["qa_status"]=="PASS"]),("exception_manifest.csv",[r for r in rows if r["qa_status"]=="FAIL"])]:
+              with open(QA/fn,"w",encoding="utf-8-sig",newline="") as f: w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(data)
+          with open(QA/"qa_details.csv","w",encoding="utf-8-sig",newline="") as f:
+              fd=["adcode","name","severity","issue_code","message"]; w=csv.DictWriter(f,fieldnames=fd); w.writeheader(); w.writerows(details)
+          with open(QA/"direct_download_manifest.csv","w",encoding="utf-8-sig",newline="") as f:
+              fd=["adcode","status","bytes","sha256","url","error"]; w=csv.DictWriter(f,fieldnames=fd); w.writeheader(); w.writerows(sorted(download_rows,key=lambda r:r["adcode"]))
+          with open(QA/"snapshot_district_source_manifest.csv","w",encoding="utf-8-sig",newline="") as f:
+              fd=["adcode","path","sha256"]; w=csv.DictWriter(f,fieldnames=fd); w.writeheader(); w.writerows([{"adcode":c,"path":str(p.relative_to(REPO)),"sha256":sha256_file(p)} for c,p in sorted(repo_district.items())])
+          with open(QA/"direct_source_sha256_manifest.txt","w",encoding="utf-8") as f:
+              for p in sorted(RAW_DIRECT.glob("*.json")): f.write(f"{sha256_file(p)}  {p.name}\n")
 
-              status = "PASS" if not hard else "FAIL"
-              row = {
-                  "asset_id": f"ADM-{code}",
-                  "adcode": code,
-                  "name": name,
-                  "level": meta["level"],
-                  "parent_adcode": meta["parent_adcode"] or "",
-                  "qa_status": status,
-                  "hard_issue_count": len(hard),
-                  "warning_count": len(warns),
-                  "source_id": SOURCE_ID,
-                  "source_url": BASE_URL + code + ".json",
-                  "source_bytes": source_bytes,
-                  "source_sha256": source_sha,
-                  "geometry_sha256": canonical_hash(geom) if isinstance(geom, dict) else "",
-                  "geometry_type": geom.get("type") if isinstance(geom, dict) else "",
-                  "normalized_sha256": "",
-              }
-
-              if status == "PASS" and feature is not None and geom is not None:
-                  sg = shape(geom)
-                  pass_geoms[code] = sg
-                  norm = {
-                      "type": "FeatureCollection",
-                      "features": [{
-                          "type": "Feature",
-                          "properties": {
-                              "asset_id": f"ADM-{code}",
-                              "adcode": int(code),
-                              "name": name,
-                              "level": meta["level"],
-                              "parent_adcode": int(meta["parent_adcode"]) if meta["parent_adcode"] and meta["parent_adcode"].isdigit() else meta["parent_adcode"],
-                              "source_id": SOURCE_ID,
-                              "source_url": BASE_URL + code + ".json",
-                              "source_sha256": source_sha,
-                              "geometry_sha256": canonical_hash(geom),
-                              "reference_repository": "zhChuXiao/ChinaGeoJson",
-                              "reference_commit": REFERENCE_COMMIT,
-                              "default_role": "ACTIVE_DEFAULT_CANDIDATE",
-                              "original_properties": feature.get("properties") or {},
-                          },
-                          "geometry": geom,
-                      }],
-                  }
-                  out = NORM / f"ADM-{code}.geojson"
-                  out.write_text(json.dumps(norm, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-                  row["normalized_sha256"] = sha256_file(out)
-              asset_rows.append(row)
-
-          # Non-blocking internal relationship diagnostic: official center point should intersect a valid PASS parent.
-          row_by_code = {r["adcode"]: r for r in asset_rows}
-          for code in subnational_codes:
-              meta = expected[code]
-              parent = meta["parent_adcode"]
-              if not parent or parent == "100000":
-                  continue
-              if code not in pass_geoms or parent not in pass_geoms:
-                  continue
-              center = meta.get("center")
-              if isinstance(center, list) and len(center) >= 2:
-                  try:
-                      pt = Point(float(center[0]), float(center[1]))
-                      if not pass_geoms[parent].covers(pt):
-                          add_detail(code, meta["name"], "WARN", "CENTER_OUTSIDE_PARENT", f"center={center}; parent={parent}")
-                          row_by_code[code]["warning_count"] = int(row_by_code[code]["warning_count"]) + 1
-                  except Exception as e:
-                      add_detail(code, meta["name"], "WARN", "CENTER_PARENT_CHECK_ERROR", repr(e))
-                      row_by_code[code]["warning_count"] = int(row_by_code[code]["warning_count"]) + 1
-
-          # Reports
-          fields = ["asset_id","adcode","name","level","parent_adcode","qa_status","hard_issue_count","warning_count","source_id","source_url","source_bytes","source_sha256","geometry_sha256","geometry_type","normalized_sha256"]
-          with open(QA / "asset_index.csv", "w", encoding="utf-8-sig", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(asset_rows)
-
-          with open(QA / "qa_details.csv", "w", encoding="utf-8-sig", newline="") as f:
-              fields2 = ["adcode","name","severity","issue_code","message"]
-              w = csv.DictWriter(f, fieldnames=fields2); w.writeheader(); w.writerows(qa_details)
-
-          with open(QA / "download_manifest.csv", "w", encoding="utf-8-sig", newline="") as f:
-              fields3 = ["adcode","status","bytes","sha256","url","error"]
-              w = csv.DictWriter(f, fieldnames=fields3); w.writeheader(); w.writerows(sorted(download_rows, key=lambda r:r["adcode"]))
-
-          with open(QA / "metadata_drift.csv", "w", encoding="utf-8-sig", newline="") as f:
-              fields4 = ["adcode","reference","current"]
-              w = csv.DictWriter(f, fieldnames=fields4); w.writeheader(); w.writerows(drift_rows)
-
-          with open(QA / "source_sha256_manifest.txt", "w", encoding="utf-8") as f:
-              for p in sorted(RAW.glob("*.json")):
-                  f.write(f"{sha256_file(p)}  {p.name}\n")
-
-          pass_rows = [r for r in asset_rows if r["qa_status"] == "PASS"]
-          fail_rows = [r for r in asset_rows if r["qa_status"] == "FAIL"]
-          with open(QA / "lock_manifest.csv", "w", encoding="utf-8-sig", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(pass_rows)
-          with open(QA / "exception_manifest.csv", "w", encoding="utf-8-sig", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(fail_rows)
-
-          pass_counts = Counter(r["level"] for r in pass_rows)
-          fail_counts = Counter(r["level"] for r in fail_rows)
-          fail_issue_counts = Counter(d["issue_code"] for d in qa_details if d["severity"] == "FAIL")
-          warning_issue_counts = Counter(d["issue_code"] for d in qa_details if d["severity"] == "WARN")
-          downloaded_ok = sum(r["status"] == "OK" for r in download_rows if r["adcode"] != "100000")
-          fatal = []
-          if len(subnational_codes) != 3237:
-              fatal.append(f"reference subnational count expected 3237, got {len(subnational_codes)}")
-          if downloaded_ok < int(len(subnational_codes) * 0.95):
-              fatal.append(f"download success below 95%: {downloaded_ok}/{len(subnational_codes)}")
-          if expected_counts.get("province") != 34:
-              fatal.append(f"reference province count expected 34, got {expected_counts.get('province')}")
-
-          overall = "STRUCTURAL_FAIL" if fatal else ("PASS_WITH_EXCEPTIONS" if fail_rows else "PASS")
-          summary = {
-              "batch_id": BATCH_ID,
-              "source_id": SOURCE_ID,
-              "source_base_url": BASE_URL,
-              "reference_repository": "zhChuXiao/ChinaGeoJson",
-              "reference_commit": REFERENCE_COMMIT,
-              "policy": "Direct DataV base geometry per adcode. No geometry repair. Invalid/missing assets go to exception queue; cross-source differences do not fail the library.",
-              "country_100000_role": "archived reference only; never formal national-standard China map",
-              "reference_expected_counts": dict(expected_counts),
-              "subnational_expected_total": len(subnational_codes),
-              "download_success_subnational": downloaded_ok,
-              "pass_total": len(pass_rows),
-              "fail_total": len(fail_rows),
-              "pass_by_level": dict(pass_counts),
-              "fail_by_level": dict(fail_counts),
-              "fail_issue_counts": dict(fail_issue_counts),
-              "warning_issue_counts": dict(warning_issue_counts),
-              "metadata_drift_count_vs_locked_reference": len(drift_rows),
-              "current_info_download_error": current_info_error,
-              "overall_status": overall,
-              "fatal_reasons": fatal,
-              "lock_policy": "PASS assets may become ACTIVE DEFAULT; FAIL assets remain unlocked and require OVERRIDE or later replacement; ACTIVE OVERRIDE always wins.",
-              "licensing_note": "Repository code is MIT-licensed; DataV upstream data usage/redistribution rights are a separate review item and are not inferred from the repository license.",
+          pass_rows=[r for r in rows if r["qa_status"]=="PASS"]; fail_rows=[r for r in rows if r["qa_status"]=="FAIL"]
+          pass_counts=Counter(r["level"] for r in pass_rows); fail_counts=Counter(r["level"] for r in fail_rows); issues=Counter(d["issue_code"] for d in details if d["severity"]=="FAIL")
+          direct_ok=sum(r["status"]=="OK" for r in download_rows)
+          fatal=[]
+          if len(subnational)!=3237: fatal.append(f"expected 3237 subnational objects, got {len(subnational)}")
+          if expected_counts.get("province")!=34 or expected_counts.get("city")!=363 or expected_counts.get("district")!=2840: fatal.append(f"unexpected reference level counts: {dict(expected_counts)}")
+          if direct_ok < int(len(direct_targets)*0.95): fatal.append(f"direct source availability below 95%: {direct_ok}/{len(direct_targets)}")
+          overall="STRUCTURAL_FAIL" if fatal else ("PASS_WITH_EXCEPTIONS" if fail_rows else "PASS")
+          summary={
+              "batch_id":"QA-20260907-DATAV-V3-COMBINED-ADM-DEFAULT-CANDIDATE",
+              "reference_repository":"zhChuXiao/ChinaGeoJson","reference_commit":COMMIT,
+              "policy":"Use locked snapshot basic district files where uniquely preserved; use direct DataV base files for all province/city assets and district gaps caused by Chinese-name filename collisions. No geometry repair.",
+              "country_100000_role":"reference only; not formal China standard map",
+              "expected_counts":dict(expected_counts),"expected_total":len(subnational),
+              "snapshot_district_coverage":len(repo_district),"missing_snapshot_district_count":len(missing_district),"missing_snapshot_district_codes":missing_district,
+              "direct_target_count":len(direct_targets),"direct_download_success":direct_ok,
+              "pass_total":len(pass_rows),"fail_total":len(fail_rows),"pass_by_level":dict(pass_counts),"fail_by_level":dict(fail_counts),"fail_issue_counts":dict(issues),
+              "overall_status":overall,"fatal_reasons":fatal,
+              "lock_policy":"PASS -> ACTIVE DEFAULT candidate; FAIL -> unlocked exception requiring OVERRIDE or replacement; ACTIVE OVERRIDE always wins.",
+              "licensing_note":"GitHub repository license and DataV upstream data rights are separate; commercial redistribution rights are not inferred from repository MIT license."
           }
-          (QA / "qa_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-          print("=== TEA_MAP_QA_V2_SUMMARY ===")
-          print(json.dumps(summary, ensure_ascii=False, indent=2))
-          print("=== END_TEA_MAP_QA_V2_SUMMARY ===")
-          if fatal:
-              raise SystemExit(2)
+          (QA/"qa_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+          print("=== TEA_MAP_QA_V3_SUMMARY ==="); print(json.dumps(summary,ensure_ascii=False,indent=2)); print("=== END_TEA_MAP_QA_V3_SUMMARY ===")
+          if fatal: raise SystemExit(2)
           PY
-          python tea_map_spatial_qa_v2.py
+          python tea_map_spatial_qa_v3.py
 
-      - name: Build archive packages
+      - name: Build packages
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p bundles
-          if [ -d raw_direct ]; then tar -czf bundles/RAW_DATAV_V3_DIRECT_20260907.tar.gz raw_direct; fi
-          if [ -d qa_v2 ]; then tar -czf bundles/QA_DATAV_V3_DIRECT_20260907.tar.gz qa_v2; fi
-          if [ -d normalized_pass ]; then tar -czf bundles/NORMALIZED_PASS_ADM_DATAV_V3_20260907.tar.gz normalized_pass; fi
+          if [ -d raw_direct_delta ]; then tar -czf bundles/RAW_DATAV_V3_DIRECT_DELTA_20260907.tar.gz raw_direct_delta; fi
+          if [ -d qa_v3 ]; then tar -czf bundles/QA_DATAV_V3_COMBINED_20260907.tar.gz qa_v3; fi
+          if [ -d normalized_pass ]; then tar -czf bundles/NORMALIZED_PASS_ADM_DATAV_V3_COMBINED_20260907.tar.gz normalized_pass; fi
           sha256sum bundles/*.tar.gz > bundles/BUNDLE_SHA256_MANIFEST.txt 2>/dev/null || true
-          cat bundles/BUNDLE_SHA256_MANIFEST.txt || true
 
-      - name: Upload direct RAW snapshot
+      - name: Upload direct RAW delta
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: RAW-DataV-V3-DIRECT-20260907
-          path: bundles/RAW_DATAV_V3_DIRECT_20260907.tar.gz
+          name: RAW-DataV-V3-DIRECT-DELTA-20260907
+          path: bundles/RAW_DATAV_V3_DIRECT_DELTA_20260907.tar.gz
           if-no-files-found: warn
           retention-days: 30
 
@@ -439,8 +250,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QA-DataV-V3-DIRECT-ADM-20260907
-          path: bundles/QA_DATAV_V3_DIRECT_20260907.tar.gz
+          name: QA-DataV-V3-COMBINED-ADM-20260907
+          path: bundles/QA_DATAV_V3_COMBINED_20260907.tar.gz
           if-no-files-found: warn
           retention-days: 30
 
@@ -448,8 +259,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: NORMALIZED-PASS-ADM-DataV-V3-20260907
-          path: bundles/NORMALIZED_PASS_ADM_DATAV_V3_20260907.tar.gz
+          name: NORMALIZED-PASS-ADM-DataV-V3-COMBINED-20260907
+          path: bundles/NORMALIZED_PASS_ADM_DATAV_V3_COMBINED_20260907.tar.gz
           if-no-files-found: warn
           retention-days: 30
 
@@ -457,7 +268,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MANIFEST-DataV-V3-DIRECT-ADM-20260907
+          name: MANIFEST-DataV-V3-COMBINED-ADM-20260907
           path: bundles/BUNDLE_SHA256_MANIFEST.txt
           if-no-files-found: warn
           retention-days: 30
