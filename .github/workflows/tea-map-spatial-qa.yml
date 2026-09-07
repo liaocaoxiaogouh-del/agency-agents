@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  current-mapjson-gap:
+  current-mapjson-gap-v2:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -19,18 +19,18 @@ jobs:
       - name: Install geometry validator
         run: python -m pip install --disable-pip-version-check --quiet shapely
 
-      - name: Fetch current mapjson files and QA target features
+      - name: Fetch current mapjson and classify current-code versus code-drift assets
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p current_mapjson/raw current_mapjson/normalized
-          cat > current_mapjson/fetch.sh <<'SH'
+          mkdir -p current_mapjson_v2/raw current_mapjson_v2/normalized current_mapjson_v2/code_drift_candidates
+          cat > current_mapjson_v2/fetch.sh <<'SH'
           #!/usr/bin/env bash
           set -u
           fetch_one(){
             key="$1"; url="$2"
-            code=$(curl -L --compressed --max-time 15 -A 'Mozilla/5.0 TeaMapCurrentMapjson/1.0' -sS -w '%{http_code}' -o "current_mapjson/raw/${key}.json" "$url" || echo ERR)
-            printf '%s\t%s\t%s\n' "$key" "$code" "$(wc -c < current_mapjson/raw/${key}.json 2>/dev/null || echo 0)" > "current_mapjson/${key}.meta"
+            code=$(curl -L --compressed --max-time 15 -A 'Mozilla/5.0 TeaMapCurrentMapjsonV2/1.0' -sS -w '%{http_code}' -o "current_mapjson_v2/raw/${key}.json" "$url" || echo ERR)
+            printf '%s\t%s\t%s\n' "$key" "$code" "$(wc -c < current_mapjson_v2/raw/${key}.json 2>/dev/null || echo 0)" > "current_mapjson_v2/${key}.meta"
           }
           fetch_one cq 'https://geojsoncn.com/mapjson/%E5%B8%82/%E9%87%8D%E5%BA%86%E5%B8%82.json' &
           fetch_one linzhi 'https://geojsoncn.com/mapjson/%E5%B8%82/%E6%9E%97%E8%8A%9D%E5%B8%82.json' &
@@ -38,16 +38,16 @@ jobs:
           fetch_one hetian 'https://geojsoncn.com/mapjson/%E5%B8%82/%E5%92%8C%E7%94%B0%E5%9C%B0%E5%8C%BA.json' &
           fetch_one sansha 'https://geojsoncn.com/mapjson/%E5%B8%82/%E4%B8%89%E6%B2%99%E5%B8%82.json' &
           wait
-          cat current_mapjson/*.meta
+          cat current_mapjson_v2/*.meta
           SH
-          bash current_mapjson/fetch.sh
+          bash current_mapjson_v2/fetch.sh
           python - <<'PY'
-          import csv,hashlib,json,os
+          import csv, hashlib, json
           from pathlib import Path
           from shapely.geometry import shape
           from shapely.validation import explain_validity
 
-          ROOT=Path('current_mapjson'); RAW=ROOT/'raw'; NORM=ROOT/'normalized'
+          ROOT=Path('current_mapjson_v2'); RAW=ROOT/'raw'; NORM=ROOT/'normalized'; DRIFT=ROOT/'code_drift_candidates'
           targets={
             'cq':{'500157':'两江新区'},
             'linzhi':{'540481':'米林市'},
@@ -55,68 +55,93 @@ jobs:
             'hetian':{'653228':'和康县','653229':'和安县'},
             'sansha':{'460302':'西沙区','460303':'南沙区'},
           }
-          def sha(b):return hashlib.sha256(b).hexdigest()
-          def can(o):return sha(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode())
+          def shab(b): return hashlib.sha256(b).hexdigest()
+          def can(o): return shab(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode())
+          def prop_name(pr):
+            for k in ['name','NAME','Name','fullname','fullName']:
+              if pr.get(k) not in [None,'']: return str(pr.get(k))
+            return ''
+          def prop_code(pr):
+            for k in ['adcode','PAC','pac','code','gb','gbCode','GB']:
+              v=pr.get(k)
+              if v is None: continue
+              s=''.join(ch for ch in str(v) if ch.isdigit())
+              if len(s)==6: return s,k,str(v)
+              if len(s)>=9: return s[-6:],k,str(v)
+            return None,None,None
           def valid(g):
-            if not isinstance(g,dict):return False,'GEOM_MISSING'
-            if g.get('type') not in {'Polygon','MultiPolygon'}:return False,'GEOM_TYPE:'+str(g.get('type'))
-            if not g.get('coordinates'):return False,'GEOM_EMPTY'
+            if not isinstance(g,dict): return False,'GEOM_MISSING'
+            if g.get('type') not in {'Polygon','MultiPolygon'}: return False,'GEOM_TYPE:'+str(g.get('type'))
+            if not g.get('coordinates'): return False,'GEOM_EMPTY'
             try:
               sg=shape(g)
-              if sg.is_empty:return False,'GEOM_EMPTY'
-              if not sg.is_valid:return False,'GEOM_INVALID:'+explain_validity(sg)
-            except Exception as e:return False,'GEOM_ERROR:'+repr(e)
+              if sg.is_empty: return False,'GEOM_EMPTY'
+              if not sg.is_valid: return False,'GEOM_INVALID:'+explain_validity(sg)
+            except Exception as e: return False,'GEOM_ERROR:'+repr(e)
             return True,''
-          def code_of(pr):
-            for k in ['adcode','code','gb','gbCode']:
-              v=pr.get(k)
-              if v is None:continue
-              s=''.join(x for x in str(v) if x.isdigit())
-              if len(s)==6:return s
-              if len(s)>=9:return s[-6:]
-            return None
+
           rows=[]; file_stats={}
           for key,expected in targets.items():
             p=RAW/f'{key}.json'; b=p.read_bytes() if p.exists() else b''
-            stat={'key':key,'bytes':len(b),'sha256':sha(b) if b else '', 'json':False,'feature_count':0}
-            idx={}
+            stat={'key':key,'bytes':len(b),'sha256':shab(b) if b else '', 'json':False,'feature_count':0}
+            features=[]
             try:
-              o=json.loads(b.decode('utf-8-sig'));stat['json']=True;fs=o.get('features',[]) if isinstance(o,dict) else [];stat['feature_count']=len(fs)
-              for i,f in enumerate(fs):
-                pr=f.get('properties') or {}; c=code_of(pr)
-                if c: idx.setdefault(c,[]).append((i,f))
+              obj=json.loads(b.decode('utf-8-sig')); features=obj.get('features',[]) if isinstance(obj,dict) else []; stat['json']=True; stat['feature_count']=len(features)
             except Exception as e: stat['error']=repr(e)
             file_stats[key]=stat
-            for c,name in expected.items():
-              rec={'adcode':c,'expected_name':name,'source_key':key,'source_sha256':stat['sha256'],'source_feature_count':stat['feature_count'],'present':'NO','actual_name':'','code_match':'NO','name_match':'NO','geometry_type':'','geometry_valid':'NO','geometry_issue':'','geometry_sha256':'','normalized_sha256':'','candidate_status':'FAIL'}
-              mm=idx.get(c,[])
-              if len(mm)==1:
-                i,f=mm[0];pr=f.get('properties') or {};g=f.get('geometry');ok,why=valid(g)
-                rec.update({'present':'YES','actual_name':str(pr.get('name') or ''),'code_match':'YES','name_match':'YES' if str(pr.get('name') or '')==name else 'NO','geometry_type':str(g.get('type') if isinstance(g,dict) else ''),'geometry_valid':'YES' if ok else 'NO','geometry_issue':why,'geometry_sha256':can(g) if isinstance(g,dict) else ''})
-                if rec['name_match']=='YES' and ok:
-                  norm={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'asset_id':'ADM-'+c,'adcode':int(c),'name':name,'source_type':'GEOJSONCN_CURRENT_MAPJSON_CANDIDATE','source_id':'SRC-GEOJSONCN-CURRENT-MAPJSON-20260907','source_url':'https://geojsoncn.com/mapjson/','source_group':key,'source_file_sha256':stat['sha256'],'geometry_sha256':rec['geometry_sha256'],'default_role':'CURRENT98_GAP_CANDIDATE','original_properties':pr},'geometry':g}]}
-                  op=NORM/f'ADM-{c}.geojson';txt=json.dumps(norm,ensure_ascii=False,separators=(',',':')).encode();op.write_bytes(txt);rec['normalized_sha256']=sha(txt);rec['candidate_status']='PASS'
-                elif rec['name_match']!='YES': rec['geometry_issue']='NAME_MISMATCH'
-              elif len(mm)>1:
-                rec['present']='MULTIPLE';rec['geometry_issue']='DUPLICATE_CODE_IN_SOURCE'
+            for current_code,expected_name in expected.items():
+              enriched=[]
+              for i,f in enumerate(features):
+                pr=f.get('properties') or {}; code,code_field,raw_code=prop_code(pr); name=prop_name(pr); g=f.get('geometry'); ok,why=valid(g)
+                enriched.append({'i':i,'f':f,'pr':pr,'code':code,'code_field':code_field,'raw_code':raw_code,'name':name,'geom_ok':ok,'geom_issue':why})
+              exact=[x for x in enriched if x['code']==current_code and x['name']==expected_name]
+              same_name=[x for x in enriched if x['name']==expected_name]
+              rec={'current_adcode':current_code,'expected_name':expected_name,'source_key':key,'source_file_sha256':stat['sha256'],'source_feature_count':stat['feature_count'],'classification':'MISSING','source_adcode':'','source_code_field':'','source_raw_code':'','feature_index':'','geometry_type':'','geometry_valid':'NO','geometry_issue':'','geometry_sha256':'','normalized_sha256':'','notes':''}
+              chosen=None
+              if len(exact)==1:
+                chosen=exact[0]
+                rec['classification']='DIRECT_CURRENT_CODE_PASS' if chosen['geom_ok'] else 'DIRECT_CURRENT_CODE_GEOM_FAIL'
+              elif len(exact)>1:
+                rec['classification']='DIRECT_CURRENT_CODE_DUPLICATE'; rec['notes']=f'exact duplicate count={len(exact)}'
               else:
-                rec['geometry_issue']='CODE_NOT_PRESENT'
+                valid_same_name=[x for x in same_name if x['geom_ok']]
+                if len(valid_same_name)==1:
+                  chosen=valid_same_name[0]
+                  rec['classification']='CODE_DRIFT_CANDIDATE'
+                  rec['notes']='same current name, valid geometry, but source PAC/code differs from current 98 master; do not rekey until administrative-change evidence confirms boundary continuity'
+                elif len(valid_same_name)>1:
+                  rec['classification']='SAME_NAME_MULTIPLE_CANDIDATES'; rec['notes']=f'valid same-name count={len(valid_same_name)}'
+                elif same_name:
+                  chosen=same_name[0]; rec['classification']='SAME_NAME_GEOM_FAIL'; rec['notes']='same-name feature exists but geometry invalid'
+                else:
+                  rec['classification']='MISSING'; rec['notes']='no same-name feature in current public preview file'
+              if chosen:
+                g=chosen['f'].get('geometry')
+                rec.update({'source_adcode':chosen['code'] or '', 'source_code_field':chosen['code_field'] or '', 'source_raw_code':chosen['raw_code'] or '', 'feature_index':chosen['i'], 'geometry_type':str(g.get('type') if isinstance(g,dict) else ''), 'geometry_valid':'YES' if chosen['geom_ok'] else 'NO', 'geometry_issue':chosen['geom_issue'], 'geometry_sha256':can(g) if isinstance(g,dict) else ''})
+                if rec['classification']=='DIRECT_CURRENT_CODE_PASS':
+                  out={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'asset_id':'ADM-'+current_code,'adcode':int(current_code),'name':expected_name,'source_type':'GEOJSONCN_CURRENT_MAPJSON_CANDIDATE','source_id':'SRC-GEOJSONCN-CURRENT-MAPJSON-20260907','source_url':'https://geojsoncn.com/mapjson/','source_group':key,'source_file_sha256':stat['sha256'],'source_code_field':chosen['code_field'],'source_raw_code':chosen['raw_code'],'geometry_sha256':rec['geometry_sha256'],'default_role':'CURRENT98_GAP_DIRECT_CANDIDATE','original_properties':chosen['pr']},'geometry':g}]}
+                  op=NORM/f'ADM-{current_code}.geojson'; data=json.dumps(out,ensure_ascii=False,separators=(',',':')).encode();op.write_bytes(data);rec['normalized_sha256']=shab(data)
+                elif rec['classification']=='CODE_DRIFT_CANDIDATE':
+                  out={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'candidate_for_current_asset_id':'ADM-'+current_code,'current_adcode':int(current_code),'current_name':expected_name,'source_adcode':int(chosen['code']) if chosen['code'] and chosen['code'].isdigit() else chosen['code'],'source_type':'GEOJSONCN_CURRENT_MAPJSON_CODE_DRIFT_CANDIDATE','source_id':'SRC-GEOJSONCN-CURRENT-MAPJSON-20260907','source_group':key,'source_file_sha256':stat['sha256'],'geometry_sha256':rec['geometry_sha256'],'promotion_status':'PENDING_BOUNDARY_CONTINUITY_EVIDENCE','original_properties':chosen['pr']},'geometry':g}]}
+                  (DRIFT/f'{current_code}_FROM_{chosen["code"]}.geojson').write_text(json.dumps(out,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
               rows.append(rec)
-          with open(ROOT/'target_results.csv','w',encoding='utf-8-sig',newline='') as f:
+          with open(ROOT/'classification.csv','w',encoding='utf-8-sig',newline='') as f:
             w=csv.DictWriter(f,fieldnames=list(rows[0].keys()));w.writeheader();w.writerows(rows)
-          summary={'source':'geojsoncn.com current mapjson public preview','file_stats':file_stats,'target_count':len(rows),'pass_count':sum(r['candidate_status']=='PASS' for r in rows),'fail_count':sum(r['candidate_status']!='PASS' for r in rows),'pass_codes':[r['adcode'] for r in rows if r['candidate_status']=='PASS'],'fail_codes':[r['adcode'] for r in rows if r['candidate_status']!='PASS'],'policy':'QA candidate only; no geometry repair. Publication/use rights remain separately reviewable.'}
+          counts={}
+          for r in rows: counts[r['classification']]=counts.get(r['classification'],0)+1
+          summary={'target_count':len(rows),'classification_counts':counts,'direct_current_code_pass':[r['current_adcode'] for r in rows if r['classification']=='DIRECT_CURRENT_CODE_PASS'],'code_drift_candidates':[{'current':r['current_adcode'],'source':r['source_adcode'],'name':r['expected_name']} for r in rows if r['classification']=='CODE_DRIFT_CANDIDATE'],'missing':[r['current_adcode'] for r in rows if r['classification']=='MISSING'],'policy':'No coordinate edits. Current-code direct candidates may proceed to source review; code-drift candidates require authoritative boundary-continuity evidence before rekeying.'}
           (ROOT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print(json.dumps(summary,ensure_ascii=False,indent=2))
-          for r in rows:print(json.dumps(r,ensure_ascii=False))
+          print('=== CURRENT_MAPJSON_V2 ===');print(json.dumps(summary,ensure_ascii=False,indent=2));print('=== END ===')
+          for r in rows: print(json.dumps(r,ensure_ascii=False))
           PY
 
-      - name: Package and upload
+      - name: Package
         shell: bash
-        run: tar -czf GEOJSONCN-CURRENT-MAPJSON-GAP-20260907.tar.gz current_mapjson
+        run: tar -czf GEOJSONCN-CURRENT-MAPJSON-GAP-V2-20260907.tar.gz current_mapjson_v2
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: GEOJSONCN-CURRENT-MAPJSON-GAP-20260907
-          path: GEOJSONCN-CURRENT-MAPJSON-GAP-20260907.tar.gz
+          name: GEOJSONCN-CURRENT-MAPJSON-GAP-V2-20260907
+          path: GEOJSONCN-CURRENT-MAPJSON-GAP-V2-20260907.tar.gz
           retention-days: 30
