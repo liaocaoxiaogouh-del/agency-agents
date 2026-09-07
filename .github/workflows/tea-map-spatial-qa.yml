@@ -9,107 +9,166 @@ permissions:
   contents: read
 
 jobs:
-  mirror-audit:
+  current98-gap-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout runner repository
         uses: actions/checkout@v4
 
-      - name: Checkout secondary mirror snapshot
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --filter=blob:none https://github.com/cebarobot/grid-to-chinese-county.git mirror
-          git -C mirror checkout fdfdc81fc2d376d42309bafc6a2e6bc764c224e8
-          test -f 'mirror/geojson/中国_省.geojson'
-          test -f 'mirror/geojson/中国_市.geojson'
-          test -f 'mirror/geojson/中国_县.geojson'
+      - name: Install validator
+        run: python -m pip install --disable-pip-version-check --quiet shapely
 
-      - name: Audit aggregate mirror
+      - name: Test current DataV assets for 98-master gaps
         shell: bash
         run: |
           set -euo pipefail
-          cat > audit.py <<'PY'
-          import csv, hashlib, json
-          from collections import defaultdict
+          cat > current98_gap_test.py <<'PY'
+          import csv, hashlib, json, time, urllib.request
           from pathlib import Path
+          from shapely.geometry import shape
+          from shapely.validation import explain_validity
 
-          ROOT=Path('mirror/geojson')
-          OUT=Path('audit'); OUT.mkdir(exist_ok=True)
-          files={
-            'province':ROOT/'中国_省.geojson',
-            'city':ROOT/'中国_市.geojson',
-            'district':ROOT/'中国_县.geojson',
+          TARGETS = {
+              '460302': '西沙区',
+              '460303': '南沙区',
+              '500157': '两江新区',
+              '540481': '米林市',
+              '540581': '错那市',
+              '653228': '和康县',
+              '653229': '和安县',
           }
-          def sha(p):
-            h=hashlib.sha256()
-            with open(p,'rb') as f:
-              for x in iter(lambda:f.read(1048576),b''): h.update(x)
-            return h.hexdigest()
-          def norm(v):
-            if v is None:return None
-            s=''.join(ch for ch in str(v) if ch.isdigit())
-            if len(s)==6:return s
-            if len(s)>=9:return s[-6:]
-            return None
-          by_code=defaultdict(list); unmapped=[]; stats={}; special=[]
-          for lvl,p in files.items():
-            obj=json.load(open(p,encoding='utf-8-sig')); fs=obj.get('features',[])
-            mapped=0
-            for i,f in enumerate(fs):
-              pr=f.get('properties') or {}; c=norm(pr.get('gb')); name=str(pr.get('name') or '')
-              if c:
-                mapped+=1; by_code[c].append({'level':lvl,'name':name,'raw_gb':str(pr.get('gb')),'feature_index':i,'source_file':p.name})
-              else:
-                unmapped.append({'level':lvl,'feature_index':i,'name':name,'properties':json.dumps(pr,ensure_ascii=False)})
-              if ('监利' in name) or ('水城' in name):
-                special.append({'level':lvl,'feature_index':i,'name':name,'raw_gb':str(pr.get('gb') or ''),'normalized_code':c or '','properties':json.dumps(pr,ensure_ascii=False)})
-            stats[lvl]={'features':len(fs),'mapped':mapped,'unmapped':len(fs)-mapped,'bytes':p.stat().st_size,'sha256':sha(p)}
-          dups=[]
-          for c,items in sorted(by_code.items()):
-            if len(items)>1:
-              for item in items:
-                dups.append({'adcode':c,**item,'duplicate_count':len(items)})
-          with open(OUT/'duplicate_codes.csv','w',encoding='utf-8-sig',newline='') as f:
-            fields=['adcode','level','name','raw_gb','feature_index','source_file','duplicate_count']; w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(dups)
-          with open(OUT/'unmapped_features.csv','w',encoding='utf-8-sig',newline='') as f:
-            fields=['level','feature_index','name','properties'];w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(unmapped)
-          with open(OUT/'special_name_lookup.csv','w',encoding='utf-8-sig',newline='') as f:
-            fields=['level','feature_index','name','raw_gb','normalized_code','properties'];w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(special)
-          summary={
-            'repository':'cebarobot/grid-to-chinese-county',
-            'commit':'fdfdc81fc2d376d42309bafc6a2e6bc764c224e8',
-            'files':stats,
-            'unique_normalized_codes':len(by_code),
-            'duplicate_code_count':sum(1 for v in by_code.values() if len(v)>1),
-            'duplicate_feature_rows':len(dups),
-            'unmapped_feature_count':len(unmapped),
-            'special_name_hits':special,
-            'provenance_status':'UNVERIFIED_MIRROR_CANDIDATE',
-            'promotion_rule':'Do not promote to formal LOCK solely from filename, size, gb field, or geometric validity. Provenance/source-rights review required.'
+          BASE = 'https://geo.datav.aliyun.com/areas_v3/bound/'
+          OUT = Path('current98_gap_test')
+          RAW = OUT / 'raw'
+          OUT.mkdir(exist_ok=True)
+          RAW.mkdir(exist_ok=True)
+
+          def sha256_bytes(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def valid_geom(g):
+              if not isinstance(g, dict):
+                  return False, 'GEOM_MISSING'
+              if g.get('type') not in {'Polygon', 'MultiPolygon'}:
+                  return False, 'GEOM_TYPE:' + str(g.get('type'))
+              if not g.get('coordinates'):
+                  return False, 'GEOM_EMPTY'
+              try:
+                  sg = shape(g)
+                  if sg.is_empty:
+                      return False, 'GEOM_EMPTY'
+                  if not sg.is_valid:
+                      return False, 'GEOM_INVALID:' + explain_validity(sg)
+              except Exception as e:
+                  return False, 'GEOM_ERROR:' + repr(e)
+              return True, ''
+
+          def download(code):
+              url = BASE + code + '.json'
+              last = None
+              for i in range(4):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 TeaMapCurrent98QA/1.0'})
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          status = getattr(r, 'status', 200)
+                          data = r.read()
+                      return True, status, data, ''
+                  except Exception as e:
+                      last = e
+                      time.sleep(0.25 * (i + 1))
+              return False, None, b'', repr(last)
+
+          rows = []
+          for code, expected_name in TARGETS.items():
+              ok, http_status, data, err = download(code)
+              row = {
+                  'adcode': code,
+                  'expected_name': expected_name,
+                  'download_status': 'OK' if ok else 'FAIL',
+                  'http_status': '' if http_status is None else http_status,
+                  'bytes': len(data),
+                  'sha256': sha256_bytes(data) if data else '',
+                  'feature_count': '',
+                  'actual_adcode': '',
+                  'actual_name': '',
+                  'actual_level': '',
+                  'parent_adcode': '',
+                  'geometry_type': '',
+                  'geometry_valid': 'NO',
+                  'issue': err,
+                  'candidate_status': 'FAIL',
+              }
+              if ok:
+                  p = RAW / f'{code}.json'
+                  p.write_bytes(data)
+                  try:
+                      obj = json.loads(data.decode('utf-8-sig'))
+                  except Exception as e:
+                      row['issue'] = 'JSON_PARSE:' + repr(e)
+                      rows.append(row)
+                      continue
+                  feats = obj.get('features', []) if isinstance(obj, dict) else []
+                  row['feature_count'] = len(feats)
+                  matches = [f for f in feats if str((f.get('properties') or {}).get('adcode')) == code]
+                  feat = matches[0] if len(matches) == 1 else (feats[0] if len(feats) == 1 else None)
+                  if feat is None:
+                      row['issue'] = 'TARGET_FEATURE_NOT_FOUND'
+                      rows.append(row)
+                      continue
+                  pr = feat.get('properties') or {}
+                  par = pr.get('parent') or {}
+                  row['actual_adcode'] = str(pr.get('adcode') or '')
+                  row['actual_name'] = str(pr.get('name') or '')
+                  row['actual_level'] = str(pr.get('level') or '')
+                  row['parent_adcode'] = str(par.get('adcode') or '')
+                  geom = feat.get('geometry')
+                  row['geometry_type'] = str(geom.get('type') if isinstance(geom, dict) else '')
+                  vg, why = valid_geom(geom)
+                  row['geometry_valid'] = 'YES' if vg else 'NO'
+                  issues = []
+                  if row['actual_adcode'] != code:
+                      issues.append('ADCODE_MISMATCH')
+                  if row['actual_name'] != expected_name:
+                      issues.append('NAME_MISMATCH')
+                  if not vg:
+                      issues.append(why)
+                  row['issue'] = ';'.join(issues)
+                  if not issues:
+                      row['candidate_status'] = 'PASS'
+              rows.append(row)
+
+          with open(OUT / 'results.csv', 'w', encoding='utf-8-sig', newline='') as f:
+              fields = list(rows[0].keys())
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              w.writerows(rows)
+
+          summary = {
+              'target_count': len(TARGETS),
+              'download_ok_count': sum(1 for r in rows if r['download_status'] == 'OK'),
+              'pass_count': sum(1 for r in rows if r['candidate_status'] == 'PASS'),
+              'fail_count': sum(1 for r in rows if r['candidate_status'] != 'PASS'),
+              'pass_codes': [r['adcode'] for r in rows if r['candidate_status'] == 'PASS'],
+              'fail_codes': [r['adcode'] for r in rows if r['candidate_status'] != 'PASS'],
+              'policy': 'No make_valid, clipping, smoothing, island deletion, or manual geometry repair.',
           }
-          (OUT/'mirror_audit_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          (OUT / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('=== CURRENT98_GAP_TEST_SUMMARY ===')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          print('=== END_CURRENT98_GAP_TEST_SUMMARY ===')
+          for r in rows:
+              print(json.dumps(r, ensure_ascii=False))
           PY
-          python audit.py
+          python current98_gap_test.py
 
-      - name: Package exact source snapshot
+      - name: Package results
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p package/source
-          cp 'mirror/geojson/中国_省.geojson' package/source/
-          cp 'mirror/geojson/中国_市.geojson' package/source/
-          cp 'mirror/geojson/中国_县.geojson' package/source/
-          cp -r audit package/
-          printf '%s\n' 'repository=cebarobot/grid-to-chinese-county' 'commit=fdfdc81fc2d376d42309bafc6a2e6bc764c224e8' > package/SNAPSHOT.txt
-          sha256sum package/source/* > package/SOURCE_SHA256_MANIFEST.txt
-          tar -czf CEBAROBOT-CHINA-ADMIN-MIRROR-SNAPSHOT-20260907.tar.gz package
+        run: tar -czf CURRENT98-GAP-DATAV-TEST-20260907.tar.gz current98_gap_test
 
-      - name: Upload mirror snapshot and audit
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: CEBAROBOT-CHINA-ADMIN-MIRROR-SNAPSHOT-20260907
-          path: CEBAROBOT-CHINA-ADMIN-MIRROR-SNAPSHOT-20260907.tar.gz
+          name: CURRENT98-GAP-DATAV-TEST-20260907
+          path: CURRENT98-GAP-DATAV-TEST-20260907.tar.gz
           retention-days: 30
