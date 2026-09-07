@@ -9,84 +9,72 @@ permissions:
   contents: read
 
 jobs:
-  geojsoncn-fast-probe:
+  resolve-endpoint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout runner repository
         uses: actions/checkout@v4
 
-      - name: Probe current-map pages and assets concurrently
+      - name: Fetch page-specific app scripts and test static JSON paths
         shell: bash
         run: |
           set -euo pipefail
-          cat > probe.py <<'PY'
-          import json,re,urllib.parse,urllib.request
+          mkdir -p endpoint_probe
+          python - <<'PY'
+          import json,re,urllib.request
           from concurrent.futures import ThreadPoolExecutor,as_completed
           from pathlib import Path
-          OUT=Path('probe');OUT.mkdir(exist_ok=True)
-          UA={'User-Agent':'Mozilla/5.0 TeaMapFastProbe/1.0'}
-          pages={
-          'cq':'https://geojsoncn.com/%E5%B8%82/%E9%87%8D%E5%BA%86%E5%B8%82.html',
-          'linzhi':'https://geojsoncn.com/%E5%B8%82/%E6%9E%97%E8%8A%9D%E5%B8%82.html',
-          'shannan':'https://geojsoncn.com/%E5%B8%82/%E5%B1%B1%E5%8D%97%E5%B8%82.html',
-          'hetian':'https://geojsoncn.com/%E5%B8%82/%E5%92%8C%E7%94%B0%E5%9C%B0%E5%8C%BA.html',
-          'sansha':'https://geojsoncn.com/%E5%B8%82/%E4%B8%89%E6%B2%99%E5%B8%82.html'}
-          def fetch(url,t=10):
-            req=urllib.request.Request(url,headers=UA)
-            with urllib.request.urlopen(req,timeout=t) as r:return getattr(r,'status',200),r.headers.get('Content-Type',''),r.read(),r.geturl()
-          res={'pages':{},'scripts':{},'hits':[],'guesses':[]};scripts=set()
-          def page_job(k,u):
+          OUT=Path('endpoint_probe')
+          items={
+            'cq':('https://geojsoncn.com/app.js?file=%E5%B8%82%2F%E9%87%8D%E5%BA%86%E5%B8%82.json','https://geojsoncn.com/%E5%B8%82/%E9%87%8D%E5%BA%86%E5%B8%82.json'),
+            'linzhi':('https://geojsoncn.com/app.js?file=%E5%B8%82%2F%E6%9E%97%E8%8A%9D%E5%B8%82.json','https://geojsoncn.com/%E5%B8%82/%E6%9E%97%E8%8A%9D%E5%B8%82.json'),
+            'shannan':('https://geojsoncn.com/app.js?file=%E5%B8%82%2F%E5%B1%B1%E5%8D%97%E5%B8%82.json','https://geojsoncn.com/%E5%B8%82/%E5%B1%B1%E5%8D%97%E5%B8%82.json'),
+            'hetian':('https://geojsoncn.com/app.js?file=%E5%B8%82%2F%E5%92%8C%E7%94%B0%E5%9C%B0%E5%8C%BA.json','https://geojsoncn.com/%E5%B8%82/%E5%92%8C%E7%94%B0%E5%9C%B0%E5%8C%BA.json'),
+            'sansha':('https://geojsoncn.com/app.js?file=%E5%B8%82%2F%E4%B8%89%E6%B2%99%E5%B8%82.json','https://geojsoncn.com/%E5%B8%82/%E4%B8%89%E6%B2%99%E5%B8%82.json'),
+          }
+          UA={'User-Agent':'Mozilla/5.0 TeaMapEndpointProbe/1.0','Accept-Encoding':'identity'}
+          def get(url):
             try:
-              st,ct,b,final=fetch(u);text=b.decode('utf-8','replace');(OUT/f'{k}.html').write_text(text,encoding='utf-8')
-              ss=[urllib.parse.urljoin(final,x) for x in re.findall(r'<script[^>]+src=[\"\']([^\"\']+)',text,re.I)]
-              return k,{'status':st,'bytes':len(b),'final':final},ss,text
-            except Exception as e:return k,{'error':repr(e)},[],''
-          with ThreadPoolExecutor(max_workers=5) as ex:
-            fut=[ex.submit(page_job,k,u) for k,u in pages.items()]
-            for f in as_completed(fut):
-              k,m,ss,text=f.result();res['pages'][k]=m;scripts.update(ss)
-              for needle in ['500157','540481','540581','653228','653229','460302','460303','geojson','download','api']:
-                for mm in re.finditer(re.escape(needle),text,re.I):res['hits'].append({'src':k,'needle':needle,'text':text[max(0,mm.start()-180):mm.start()+450]})
-          def script_job(i,u):
-            try:
-              st,ct,b,final=fetch(u);text=b.decode('utf-8','replace');fn=f'script_{i:02d}.js';(OUT/fn).write_text(text,encoding='utf-8')
+              req=urllib.request.Request(url,headers=UA)
+              with urllib.request.urlopen(req,timeout=15) as r:
+                return {'ok':True,'status':getattr(r,'status',200),'ct':r.headers.get('Content-Type',''),'ce':r.headers.get('Content-Encoding',''),'final':r.geturl(),'data':r.read()}
+            except Exception as e:return {'ok':False,'error':repr(e),'data':b''}
+          summary={}
+          for key,(app_url,json_url) in items.items():
+            app=get(app_url); js=app.pop('data')
+            if js:
+              text=js.decode('utf-8','replace'); (OUT/f'{key}_app.js').write_text(text,encoding='utf-8')
               hits=[]
-              for needle in ['500157','540481','540581','653228','653229','460302','460303','geojson','download','api/','fetch(','axios']:
-                for mm in list(re.finditer(re.escape(needle),text,re.I))[:30]:hits.append({'src':u,'needle':needle,'text':text[max(0,mm.start()-250):mm.start()+700]})
-              return u,{'status':st,'bytes':len(b),'file':fn},hits
-            except Exception as e:return u,{'error':repr(e)},[]
-          with ThreadPoolExecutor(max_workers=10) as ex:
-            fut=[ex.submit(script_job,i,u) for i,u in enumerate(sorted(scripts))]
-            for f in as_completed(fut):
-              u,m,h=f.result();res['scripts'][u]=m;res['hits']+=h
-          codes=['500157','540481','540581','653228','653229','460302','460303']
-          templates=['https://geojsoncn.com/data/{code}.json','https://geojsoncn.com/geojson/{code}.json','https://geojsoncn.com/api/geojson/{code}','https://geojsoncn.com/api/region/{code}','https://geojsoncn.com/api/download/{code}.geojson','https://geojsoncn.com/download/{code}.geojson']
-          def guess(u):
-            try:
-              st,ct,b,final=fetch(u,5);return {'url':u,'status':st,'ct':ct,'bytes':len(b),'final':final,'prefix':b[:100].decode('utf-8','replace')}
-            except Exception as e:return {'url':u,'error':repr(e)}
-          urls=[t.format(code=c) for c in codes for t in templates]
-          with ThreadPoolExecutor(max_workers=20) as ex:
-            for x in ex.map(guess,urls):res['guesses'].append(x)
-          (OUT/'summary.json').write_text(json.dumps(res,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('PAGES',json.dumps(res['pages'],ensure_ascii=False))
-          print('SCRIPTS',len(scripts),'HITS',len(res['hits']))
-          for h in res['hits']:
-            s=h['text']
-            if any(x in s for x in codes) or 'geojson' in s.lower() or '/api/' in s.lower() or 'download' in s.lower(): print('HIT',json.dumps(h,ensure_ascii=False)[:3000])
-          for g in res['guesses']:
-            if g.get('status')==200: print('GUESS200',json.dumps(g,ensure_ascii=False))
+              for needle in ['fetch(','XMLHttpRequest','axios','file=','.json','download','geojson','FILE','DATA','mapData','source']:
+                for m in list(re.finditer(re.escape(needle),text,re.I))[:50]:
+                  hits.append({'needle':needle,'text':text[max(0,m.start()-300):m.start()+1000]})
+              app['hits']=hits
+            stat=get(json_url); b=stat.pop('data')
+            if b:
+              (OUT/f'{key}_static.bin').write_bytes(b)
+              stat['prefix']=b[:200].decode('utf-8','replace')
+              try:
+                obj=json.loads(b.decode('utf-8-sig')); stat['json']=True; stat['type']=obj.get('type') if isinstance(obj,dict) else type(obj).__name__; stat['features']=len(obj.get('features',[])) if isinstance(obj,dict) else None
+                (OUT/f'{key}_static.json').write_bytes(b)
+              except Exception as e: stat['json']=False; stat['parse_error']=repr(e)
+            summary[key]={'app':app,'static':stat}
+          (OUT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          for k,v in summary.items():
+            print('###',k)
+            print('APP', {x:y for x,y in v['app'].items() if x!='hits'})
+            for h in v['app'].get('hits',[]):
+              if any(s in h['text'].lower() for s in ['fetch(','.json','download','file','geojson']): print('HIT',json.dumps(h,ensure_ascii=False)[:4000])
+            print('STATIC',v['static'])
           PY
-          python probe.py
 
       - name: Package and upload
         shell: bash
-        run: tar -czf GEOJSONCN-FAST-PROBE-20260907.tar.gz probe
+        run: tar -czf GEOJSONCN-ENDPOINT-PROBE-20260907.tar.gz endpoint_probe
 
       - name: Upload probe
         uses: actions/upload-artifact@v4
         with:
-          name: GEOJSONCN-FAST-PROBE-20260907
-          path: GEOJSONCN-FAST-PROBE-20260907.tar.gz
+          name: GEOJSONCN-ENDPOINT-PROBE-20260907
+          path: GEOJSONCN-ENDPOINT-PROBE-20260907.tar.gz
           retention-days: 30
