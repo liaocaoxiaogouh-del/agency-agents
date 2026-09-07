@@ -9,49 +9,60 @@ permissions:
   contents: read
 
 jobs:
-  recovery:
+  alternate-recovery:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout runner repository
         uses: actions/checkout@v4
 
-      - name: Checkout locked ChinaGeoJson snapshot
+      - name: Checkout locked DataV reference snapshot
         shell: bash
         run: |
           set -euo pipefail
-          git clone --filter=blob:none https://github.com/zhChuXiao/ChinaGeoJson.git reference_repo
-          git -C reference_repo checkout 7aa2c5fabc6a892015625898c3482874b233f9de
+          git clone --filter=blob:none https://github.com/zhChuXiao/ChinaGeoJson.git datav_repo
+          git -C datav_repo checkout 7aa2c5fabc6a892015625898c3482874b233f9de
+
+      - name: Checkout secondary aggregate mirror snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/cebarobot/grid-to-chinese-county.git alt_repo
+          git -C alt_repo checkout fdfdc81fc2d376d42309bafc6a2e6bc764c224e8
+          test -f 'alt_repo/geojson/中国_省.geojson'
+          test -f 'alt_repo/geojson/中国_市.geojson'
+          test -f 'alt_repo/geojson/中国_县.geojson'
 
       - name: Install validator
         run: python -m pip install --disable-pip-version-check --quiet shapely
 
-      - name: Recover invalid snapshot districts
+      - name: Identify DataV exceptions and test secondary mirror
         shell: bash
         run: |
           set -euo pipefail
-          cat > recovery.py <<'PY'
+          cat > alternate_recovery.py <<'PY'
           import csv, hashlib, json, math, time, urllib.request
+          from collections import Counter, defaultdict
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from pathlib import Path
           from shapely.geometry import shape
           from shapely.validation import explain_validity
 
-          REPO=Path('reference_repo')
-          OUT=Path('recovery'); RAW=OUT/'raw'; NORM=OUT/'normalized'
+          DATAV=Path('datav_repo')
+          ALT=Path('alt_repo')
+          OUT=Path('alternate_recovery'); RAW=OUT/'datav_direct'; NORM=OUT/'normalized_candidates'
           for p in (OUT,RAW,NORM): p.mkdir(parents=True,exist_ok=True)
           BASE='https://geo.datav.aliyun.com/areas_v3/bound/'
-          COMMIT='7aa2c5fabc6a892015625898c3482874b233f9de'
-          info=json.load(open(REPO/'info.json',encoding='utf-8'))
-          meta={str(c):r for c,r in info.items() if isinstance(r,dict) and r.get('level')=='district'}
+          DATAV_COMMIT='7aa2c5fabc6a892015625898c3482874b233f9de'
+          ALT_COMMIT='fdfdc81fc2d376d42309bafc6a2e6bc764c224e8'
 
           def shab(b): return hashlib.sha256(b).hexdigest()
-          def can(o): return shab(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode())
           def shp(p):
               h=hashlib.sha256()
               with open(p,'rb') as f:
                   for x in iter(lambda:f.read(1048576),b''): h.update(x)
               return h.hexdigest()
+          def can(o): return shab(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8'))
           def valid_geom(g):
               if not isinstance(g,dict): return False,'GEOM_MISSING'
               if g.get('type') not in {'Polygon','MultiPolygon'}: return False,'GEOM_TYPE:'+str(g.get('type'))
@@ -63,85 +74,146 @@ jobs:
               except Exception as e: return False,'GEOM_ERROR:'+repr(e)
               return True,''
 
-          self_files={}
-          for folder in [REPO/'county',REPO/'citys']:
+          info=json.load(open(DATAV/'info.json',encoding='utf-8'))
+          meta={str(c):r for c,r in info.items() if isinstance(r,dict) and r.get('level') in {'province','city','district'}}
+
+          # Build locked self-district index exactly as the main QA did.
+          self_district={}
+          for folder in [DATAV/'county',DATAV/'citys']:
               for p in folder.glob('*.json'):
-                  try: o=json.load(open(p,encoding='utf-8-sig'))
-                  except: continue
+                  try:o=json.load(open(p,encoding='utf-8-sig'))
+                  except:continue
                   fs=o.get('features',[]) if isinstance(o,dict) else []
-                  if len(fs)!=1: continue
+                  if len(fs)!=1:continue
                   pr=fs[0].get('properties') or {}; c=str(pr.get('adcode'))
-                  if c in meta and pr.get('level')=='district' and c not in self_files: self_files[c]=p
+                  if c in meta and meta[c].get('level')=='district' and pr.get('level')=='district' and c not in self_district:self_district[c]=p
+          missing_district=sorted(c for c,r in meta.items() if r.get('level')=='district' and c not in self_district)
+          direct_targets=sorted(set([c for c,r in meta.items() if r.get('level') in {'province','city'}]+missing_district))
 
-          invalid=[]
-          for c,p in self_files.items():
-              o=json.load(open(p,encoding='utf-8-sig')); f=o['features'][0]
-              ok,why=valid_geom(f.get('geometry'))
-              if not ok: invalid.append((c,p,why))
-          invalid.sort()
-          print('snapshot invalid districts',len(invalid))
-
+          # DataV direct acquisition only for province/city and 31 filename-collision gaps.
           def get(c):
-              url=BASE+c+'.json'; dest=RAW/(c+'.json')
-              last=None
-              for i in range(4):
+              url=BASE+c+'.json'; dest=RAW/(c+'.json'); last=None
+              for i in range(3):
                   try:
-                      req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 TeaMapRecovery/1.0'})
-                      with urllib.request.urlopen(req,timeout=15) as r: b=r.read()
-                      dest.write_bytes(b); return c,True,'',len(b),shab(b)
-                  except Exception as e: last=e; time.sleep(.25*(i+1))
-              return c,False,repr(last),0,''
-
-          results={}
+                      req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 TeaMapAltQA/1.0'})
+                      with urllib.request.urlopen(req,timeout=12) as r:b=r.read()
+                      dest.write_bytes(b);return c,True,''
+                  except Exception as e:last=e;time.sleep(.25*(i+1))
+              return c,False,repr(last)
+          dl={}
           with ThreadPoolExecutor(max_workers=12) as ex:
-              futs=[ex.submit(get,c) for c,_,_ in invalid]
+              futs=[ex.submit(get,c) for c in direct_targets]
               for f in as_completed(futs):
-                  c,ok,err,n,sha=f.result(); results[c]=(ok,err,n,sha)
+                  c,ok,e=f.result();dl[c]=(ok,e)
 
-          rows=[]; recovered=[]; still=[]
-          for c,p,oldwhy in invalid:
-              rec=meta[c]; okdl,err,n,sha=results[c]
-              row={'adcode':c,'name':rec.get('name'),'old_source':str(p.relative_to(REPO)),'old_source_sha256':shp(p),'old_issue':oldwhy,'direct_download':'OK' if okdl else 'FAIL','direct_bytes':n,'direct_sha256':sha,'direct_status':'FAIL','direct_issue':err,'normalized_sha256':''}
-              if okdl:
-                  try: o=json.load(open(RAW/(c+'.json'),encoding='utf-8-sig'))
-                  except Exception as e: o=None; row['direct_issue']='JSON_PARSE:'+repr(e)
-                  if isinstance(o,dict):
-                      fs=o.get('features',[]); matches=[x for x in fs if str((x.get('properties') or {}).get('adcode'))==c]
-                      f=matches[0] if len(matches)==1 else (fs[0] if len(fs)==1 else None)
-                      if f is None: row['direct_issue']='ADCODE_NOT_FOUND'
-                      else:
-                          pr=f.get('properties') or {}; par=pr.get('parent') or {}; expected_parent=str((rec.get('parent') or {}).get('adcode'))
-                          prop_err=[]
-                          if str(pr.get('adcode'))!=c: prop_err.append('ADCODE_MISMATCH')
-                          if pr.get('name')!=rec.get('name'): prop_err.append('NAME_MISMATCH')
-                          if pr.get('level')!='district': prop_err.append('LEVEL_MISMATCH')
-                          if str(par.get('adcode'))!=expected_parent: prop_err.append('PARENT_MISMATCH')
-                          vg,why=valid_geom(f.get('geometry'))
-                          if prop_err: row['direct_issue']=';'.join(prop_err)
-                          elif not vg: row['direct_issue']=why
-                          else:
-                              row['direct_status']='RECOVERED'; row['direct_issue']=''
-                              norm={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'asset_id':'ADM-'+c,'adcode':int(c),'name':rec.get('name'),'level':'district','parent_adcode':int(expected_parent),'source_type':'DATAV_DIRECT_RECOVERY','source_id':'SRC-DATAV-V3-DIRECT-SNAPSHOT-20260907','source_url':BASE+c+'.json','source_sha256':sha,'geometry_sha256':can(f['geometry']),'supersedes_invalid_snapshot_file':str(p.relative_to(REPO)),'reference_commit':COMMIT,'default_role':'ACTIVE_DEFAULT_CANDIDATE','original_properties':pr},'geometry':f['geometry']}]}
-                              op=NORM/('ADM-'+c+'.geojson'); op.write_text(json.dumps(norm,ensure_ascii=False,separators=(',',':')),encoding='utf-8'); row['normalized_sha256']=shp(op); recovered.append(c)
-              if row['direct_status']!='RECOVERED': still.append(c)
+          # Reconstruct main QA exception set.
+          exceptions={}
+          for c,r in meta.items():
+              lvl=r.get('level'); name=r.get('name'); p=None; feature=None; issue=''
+              if lvl=='district' and c in self_district:
+                  p=self_district[c]
+              else:
+                  p=RAW/(c+'.json')
+                  if not dl.get(c,(False,''))[0]:
+                      exceptions[c]={'name':name,'level':lvl,'issue':'DOWNLOAD_FAIL'};continue
+              try:o=json.load(open(p,encoding='utf-8-sig'))
+              except Exception as e:exceptions[c]={'name':name,'level':lvl,'issue':'JSON_PARSE:'+repr(e)};continue
+              fs=o.get('features',[]) if isinstance(o,dict) else []
+              matches=[f for f in fs if str((f.get('properties') or {}).get('adcode'))==c]
+              feature=matches[0] if len(matches)==1 else (fs[0] if len(fs)==1 else None)
+              if feature is None:exceptions[c]={'name':name,'level':lvl,'issue':'ADCODE_NOT_FOUND'};continue
+              ok,why=valid_geom(feature.get('geometry'))
+              if not ok:exceptions[c]={'name':name,'level':lvl,'issue':why}
+          print('reconstructed DataV exceptions',len(exceptions),Counter(x['level'] for x in exceptions.values()))
+
+          # Parse alternate aggregate files. Source is treated as a mirror candidate, not asserted official.
+          alt_files={'province':ALT/'geojson/中国_省.geojson','city':ALT/'geojson/中国_市.geojson','district':ALT/'geojson/中国_县.geojson'}
+          alt_index={}; alt_file_stats={}; alt_duplicate_codes=[]; alt_invalid_all=[]; alt_unmapped=[]
+
+          def norm_code(v):
+              if v is None:return None
+              s=''.join(ch for ch in str(v) if ch.isdigit())
+              if len(s)==6:return s
+              if len(s)>=9 and s[-6:].isdigit():return s[-6:]
+              return None
+          def extract_code(pr):
+              for k in ['adcode','gb','gbCode','GB','code','CODE','gbcode']:
+                  if k in pr:
+                      c=norm_code(pr.get(k))
+                      if c:return c,k,str(pr.get(k))
+              for k,v in pr.items():
+                  lk=str(k).lower()
+                  if 'code' in lk or lk=='gb':
+                      c=norm_code(v)
+                      if c:return c,str(k),str(v)
+              return None,None,None
+          def extract_name(pr):
+              for k in ['name','NAME','Name','fullname','fullName']:
+                  if pr.get(k):return str(pr.get(k))
+              return None
+
+          for lvl,p in alt_files.items():
+              o=json.load(open(p,encoding='utf-8-sig')); fs=o.get('features',[]) if isinstance(o,dict) else []
+              mapped=0; invalid=0; keys=Counter()
+              for i,f in enumerate(fs):
+                  pr=f.get('properties') or {}; c,k,raw=extract_code(pr); nm=extract_name(pr); keys[k or '<none>']+=1
+                  if not c:
+                      alt_unmapped.append({'level':lvl,'feature_index':i,'name':nm or '','properties':json.dumps(pr,ensure_ascii=False)[:1000]});continue
+                  mapped+=1
+                  ok,why=valid_geom(f.get('geometry'))
+                  if not ok:
+                      invalid+=1;alt_invalid_all.append({'adcode':c,'level':lvl,'name':nm or '','issue':why})
+                  rec={'adcode':c,'level':lvl,'name':nm,'feature':f,'valid':ok,'issue':why,'source_file':str(p.relative_to(ALT)),'source_file_sha256':shp(p),'code_field':k,'raw_code':raw}
+                  if c in alt_index:alt_duplicate_codes.append(c)
+                  else:alt_index[c]=rec
+              alt_file_stats[lvl]={'feature_count':len(fs),'mapped_count':mapped,'invalid_count':invalid,'code_field_counts':dict(keys),'sha256':shp(p),'bytes':p.stat().st_size}
+
+          # Test only DataV FAIL assets against alternate mirror.
+          rows=[]; recovered=[]; unavailable=[]; alt_invalid_targets=[]; name_mismatch=[]
+          for c,d in sorted(exceptions.items()):
+              a=alt_index.get(c)
+              row={'adcode':c,'expected_name':d['name'],'level':d['level'],'datav_issue':d['issue'],'alternate_present':'NO','alternate_name':'','alternate_valid':'NO','alternate_issue':'','name_match':'NO','candidate_status':'NO_CANDIDATE','alternate_source_file':'','alternate_source_sha256':'','geometry_sha256':'','normalized_sha256':''}
+              if not a:
+                  unavailable.append(c);rows.append(row);continue
+              row['alternate_present']='YES';row['alternate_name']=a['name'] or '';row['alternate_valid']='YES' if a['valid'] else 'NO';row['alternate_issue']=a['issue'];row['alternate_source_file']=a['source_file'];row['alternate_source_sha256']=a['source_file_sha256']
+              row['name_match']='YES' if a['name']==d['name'] else 'NO'
+              if a['name']!=d['name']:
+                  name_mismatch.append(c);row['candidate_status']='NAME_MISMATCH'
+              elif not a['valid']:
+                  alt_invalid_targets.append(c);row['candidate_status']='ALT_GEOM_INVALID'
+              else:
+                  row['candidate_status']='GEOMETRY_CANDIDATE';row['geometry_sha256']=can(a['feature']['geometry']);recovered.append(c)
+                  par=(meta[c].get('parent') or {}).get('adcode')
+                  norm={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'asset_id':'ADM-'+c,'adcode':int(c),'name':d['name'],'level':d['level'],'parent_adcode':par,'source_type':'GITHUB_AGGREGATE_MIRROR_CANDIDATE','source_id':'SRC-GITHUB-CEBAROBOT-CHINA-ADMIN-MIRROR-CANDIDATE','source_repository':'cebarobot/grid-to-chinese-county','source_commit':ALT_COMMIT,'source_file':a['source_file'],'source_file_sha256':a['source_file_sha256'],'source_code_field':a['code_field'],'source_raw_code':a['raw_code'],'geometry_sha256':can(a['feature']['geometry']),'candidate_role':'EXCEPTION_REPLACEMENT_PENDING_PROVENANCE_REVIEW','original_properties':a['feature'].get('properties') or {}},'geometry':a['feature']['geometry']}]}
+                  op=NORM/('ADM-'+c+'.geojson');op.write_text(json.dumps(norm,ensure_ascii=False,separators=(',',':')),encoding='utf-8');row['normalized_sha256']=shp(op)
               rows.append(row)
 
-          fields=list(rows[0].keys()) if rows else ['adcode']
-          with open(OUT/'recovery_manifest.csv','w',encoding='utf-8-sig',newline='') as f: w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
-          summary={'invalid_snapshot_districts':len(invalid),'direct_download_success':sum(1 for c in results if results[c][0]),'recovered_count':len(recovered),'still_invalid_count':len(still),'recovered_codes':recovered,'still_invalid_codes':still,'policy':'No geometry repair. Only replace invalid locked-snapshot candidate when current direct DataV base geometry passes all checks.'}
-          (OUT/'recovery_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('=== RECOVERY_SUMMARY ==='); print(json.dumps(summary,ensure_ascii=False,indent=2)); print('=== END_RECOVERY_SUMMARY ===')
+          fields=list(rows[0].keys())
+          with open(OUT/'exception_alternate_candidates.csv','w',encoding='utf-8-sig',newline='') as f:w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
+          with open(OUT/'alternate_invalid_all.csv','w',encoding='utf-8-sig',newline='') as f:
+              fd=['adcode','level','name','issue'];w=csv.DictWriter(f,fieldnames=fd);w.writeheader();w.writerows(alt_invalid_all)
+          with open(OUT/'alternate_unmapped.csv','w',encoding='utf-8-sig',newline='') as f:
+              fd=['level','feature_index','name','properties'];w=csv.DictWriter(f,fieldnames=fd);w.writeheader();w.writerows(alt_unmapped)
+          summary={
+              'datav_exception_total':len(exceptions),'datav_exception_by_level':dict(Counter(x['level'] for x in exceptions.values())),
+              'alternate_repository':'cebarobot/grid-to-chinese-county','alternate_commit':ALT_COMMIT,
+              'alternate_files':alt_file_stats,'alternate_duplicate_code_count':len(set(alt_duplicate_codes)),'alternate_unmapped_count':len(alt_unmapped),
+              'geometry_candidate_count':len(recovered),'no_candidate_count':len(unavailable),'alternate_invalid_target_count':len(alt_invalid_targets),'name_mismatch_count':len(name_mismatch),
+              'geometry_candidate_codes':recovered,
+              'policy':'Secondary mirror is QA-only candidate. Valid geometry + matching code/name does not promote to LOCK until provenance/source-rights review. No geometry repair was applied.'
+          }
+          (OUT/'alternate_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('=== ALTERNATE_SUMMARY ===');print(json.dumps(summary,ensure_ascii=False,indent=2));print('=== END_ALTERNATE_SUMMARY ===')
           PY
-          python recovery.py
+          python alternate_recovery.py
 
-      - name: Package recovery results
+      - name: Package alternate recovery results
         shell: bash
-        run: |
-          tar -czf RECOVERY-DATAV-V3-DISTRICT-20260907.tar.gz recovery
+        run: tar -czf ALTERNATE-RECOVERY-CEBAROBOT-20260907.tar.gz alternate_recovery
 
-      - name: Upload recovery results
+      - name: Upload alternate recovery results
         uses: actions/upload-artifact@v4
         with:
-          name: RECOVERY-DataV-V3-DISTRICT-20260907
-          path: RECOVERY-DATAV-V3-DISTRICT-20260907.tar.gz
+          name: ALTERNATE-RECOVERY-CEBAROBOT-20260907
+          path: ALTERNATE-RECOVERY-CEBAROBOT-20260907.tar.gz
           retention-days: 30
