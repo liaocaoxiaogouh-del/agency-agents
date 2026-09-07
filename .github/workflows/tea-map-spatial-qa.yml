@@ -5,61 +5,99 @@ on:
 permissions:
   contents: read
 jobs:
-  hainan-standard-map-discovery:
+  hotan-current-osm:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Discover Xisha/Nansha official standard-map links
+      - name: Install geometry validator
+        run: python -m pip install --disable-pip-version-check --quiet shapely
+      - name: Query current Hotan parent and all ten county units
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p hainan_standard_map
+          mkdir -p hotan_osm/raw hotan_osm/normalized
           python - <<'PY'
-          import json,re,urllib.parse,urllib.request
+          import csv,hashlib,json,time,urllib.parse,urllib.request
           from pathlib import Path
-          OUT=Path('hainan_standard_map')
-          UA={'User-Agent':'Mozilla/5.0 TeaMapOfficialMapDiscovery/1.0','Accept-Encoding':'identity'}
-          seeds=['https://hism.mnr.gov.cn/sjkf/hndt/']
-          seen=set(); queue=list(seeds); hits=[]; pages=[]
-          def get(u):
-            req=urllib.request.Request(u,headers=UA)
-            with urllib.request.urlopen(req,timeout=15) as r:return r.geturl(),r.headers.get('Content-Type',''),r.read()
-          while queue and len(seen)<80:
-            u=queue.pop(0)
-            if u in seen: continue
-            seen.add(u)
-            try: final,ct,b=get(u)
-            except Exception as e:
-              pages.append({'url':u,'error':repr(e)}); continue
-            pages.append({'url':u,'final':final,'ct':ct,'bytes':len(b)})
-            text=b.decode('utf-8','replace') if ('text' in ct.lower() or 'html' in ct.lower() or u.endswith(('.html','.htm','/'))) else ''
-            if text:
-              fn=OUT/f'page_{len(pages):03d}.html'; fn.write_text(text,encoding='utf-8')
-              if '西沙' in text or '南沙' in text or '三沙' in text:
-                for m in re.finditer(r'.{0,250}(?:西沙|南沙|三沙).{0,700}',text,re.S): hits.append({'page':final,'snippet':m.group(0)[:1200]})
-              for href in re.findall(r'(?:href|src)=["\']([^"\']+)',text,re.I):
-                v=urllib.parse.urljoin(final,href)
-                if v.startswith('http') and ('hism.mnr.gov.cn' in urllib.parse.urlparse(v).netloc):
-                  if any(x in v.lower() for x in ['hndt','2024','2025','sansha','xisha','nansha','download','file','jpg','eps','html','htm']):
-                    if v not in seen and len(queue)<100: queue.append(v)
-                if any(s in href.lower() for s in ['.eps','.jpg','.jpeg','.pdf']) and any(n in text for n in ['西沙','南沙','三沙']):
-                  hits.append({'page':final,'asset':v})
-          # collect direct asset-looking URLs found in all saved text
-          assets=[]
-          for p in OUT.glob('page_*.html'):
-            t=p.read_text(encoding='utf-8')
-            for x in re.findall(r'[^"\'<> ]+\.(?:eps|jpg|jpeg|pdf)(?:\?[^"\'<> ]*)?',t,re.I):
-              assets.append(x)
-          result={'visited':pages,'hits':hits[:300],'assets':assets[:500]}
-          (OUT/'discovery.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('visited',len(pages),'hits',len(hits),'assets',len(assets))
-          for h in hits[:100]: print('HIT',json.dumps(h,ensure_ascii=False)[:2000])
+          from itertools import combinations
+          from shapely.geometry import shape
+          from shapely.ops import unary_union
+
+          ROOT=Path('hotan_osm');RAW=ROOT/'raw';NORM=ROOT/'normalized'
+          targets={
+            '653200':('和田地区','新疆维吾尔自治区,中国'),
+            '653201':('和田市','和田地区,新疆维吾尔自治区,中国'),
+            '653221':('和田县','和田地区,新疆维吾尔自治区,中国'),
+            '653222':('墨玉县','和田地区,新疆维吾尔自治区,中国'),
+            '653223':('皮山县','和田地区,新疆维吾尔自治区,中国'),
+            '653224':('洛浦县','和田地区,新疆维吾尔自治区,中国'),
+            '653225':('策勒县','和田地区,新疆维吾尔自治区,中国'),
+            '653226':('于田县','和田地区,新疆维吾尔自治区,中国'),
+            '653227':('民丰县','和田地区,新疆维吾尔自治区,中国'),
+            '653228':('和康县','和田地区,新疆维吾尔自治区,中国'),
+            '653229':('和安县','和田地区,新疆维吾尔自治区,中国'),
+          }
+          UA='TeaMapSpatialQA-Hotan/1.0'
+          def shab(b):return hashlib.sha256(b).hexdigest()
+          def can(o):return shab(json.dumps(o,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode())
+          def query(code,name,ctx):
+            q=f'{name},{ctx}'
+            params={'format':'jsonv2','q':q,'polygon_geojson':'1','addressdetails':'1','extratags':'1','namedetails':'1','limit':'8','accept-language':'zh-CN,zh'}
+            url='https://nominatim.openstreetmap.org/search?'+urllib.parse.urlencode(params)
+            req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/json'})
+            with urllib.request.urlopen(req,timeout=30) as r:b=r.read()
+            (RAW/f'{code}.json').write_bytes(b)
+            return url,b,json.loads(b.decode())
+          rows=[];geoms={}
+          for code,(name,ctx) in targets.items():
+            rec={'adcode':code,'name':name,'status':'FAIL','osm_type':'','osm_id':'','admin_level':'','geometry_type':'','geometry_valid':'NO','raw_sha256':'','geometry_sha256':'','normalized_sha256':'','issue':''}
+            try:
+              url,b,data=query(code,name,ctx);rec['raw_sha256']=shab(b)
+              cands=[]
+              for x in data:
+                nd=x.get('namedetails') or {}; names={str(x.get('name') or ''),str(nd.get('name:zh') or ''),str(nd.get('name') or '')}
+                namehit=name in names or str(x.get('display_name') or '').startswith(name+',')
+                g=x.get('geojson'); valid=False
+                if isinstance(g,dict) and g.get('type') in {'Polygon','MultiPolygon'}:
+                  try: valid=(not shape(g).is_empty and shape(g).is_valid)
+                  except: valid=False
+                score=(100 if namehit else 0)+(30 if valid else 0)+(20 if x.get('osm_type')=='relation' else 0)+(10 if x.get('category')=='boundary' else 0)+(10 if x.get('type')=='administrative' else 0)
+                cands.append((score,namehit,valid,x))
+              cands.sort(key=lambda z:z[0],reverse=True)
+              if cands:
+                score,namehit,valid,x=cands[0];g=x.get('geojson'); rec.update({'osm_type':str(x.get('osm_type') or ''),'osm_id':str(x.get('osm_id') or ''),'admin_level':str((x.get('extratags') or {}).get('admin_level') or ''),'geometry_type':str(g.get('type') if isinstance(g,dict) else ''),'geometry_valid':'YES' if valid else 'NO','geometry_sha256':can(g) if isinstance(g,dict) else ''})
+                if namehit and valid and x.get('osm_type')=='relation':
+                  rec['status']='PASS';geoms[code]=shape(g)
+                  out={'type':'FeatureCollection','features':[{'type':'Feature','properties':{'asset_id':'ADM-'+code,'adcode':int(code),'name':name,'source_id':'SRC-OSM-NOMINATIM-20260907','source_type':'OPENSTREETMAP_NOMINATIM','osm_type':x.get('osm_type'),'osm_id':x.get('osm_id'),'admin_level':(x.get('extratags') or {}).get('admin_level'),'raw_sha256':rec['raw_sha256'],'geometry_sha256':rec['geometry_sha256'],'license':'OpenStreetMap contributors, ODbL 1.0','default_role':'HOTAN_CURRENT_GROUP_CANDIDATE'},'geometry':g}]}
+                  op=NORM/f'ADM-{code}.geojson';bb=json.dumps(out,ensure_ascii=False,separators=(',',':')).encode();op.write_bytes(bb);rec['normalized_sha256']=shab(bb)
+                else: rec['issue']='TOP_RESULT_NOT_EXACT_VALID_ADMIN_RELATION'
+              else: rec['issue']='NO_RESULT'
+            except Exception as e:rec['issue']='REQUEST:'+repr(e)
+            rows.append(rec);time.sleep(1.1)
+          # Topology diagnostics in the same OSM source family.
+          topo={'pairwise_positive_area_overlaps':[],'children_outside_parent_ratio':None,'children_union_area':None,'parent_area':None}
+          child_codes=[c for c in targets if c!='653200' and c in geoms]
+          for a,b in combinations(child_codes,2):
+            ga,gb=geoms[a],geoms[b]
+            if ga.bounds[2]<gb.bounds[0] or gb.bounds[2]<ga.bounds[0] or ga.bounds[3]<gb.bounds[1] or gb.bounds[3]<ga.bounds[1]:continue
+            inter=ga.intersection(gb)
+            if not inter.is_empty and inter.area>1e-12:
+              ratio=inter.area/min(ga.area,gb.area)
+              if ratio>1e-9:topo['pairwise_positive_area_overlaps'].append({'a':a,'b':b,'ratio_of_smaller':ratio,'area_deg2':inter.area})
+          if '653200' in geoms and child_codes:
+            u=unary_union([geoms[c] for c in child_codes]);p=geoms['653200'];outside=u.difference(p)
+            topo['children_union_area']=u.area;topo['parent_area']=p.area;topo['children_outside_parent_ratio']=outside.area/u.area if u.area else None
+          with open(ROOT/'asset_results.csv','w',encoding='utf-8-sig',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=list(rows[0].keys()));w.writeheader();w.writerows(rows)
+          summary={'asset_pass_count':sum(r['status']=='PASS' for r in rows),'asset_fail_count':sum(r['status']!='PASS' for r in rows),'pass_codes':[r['adcode'] for r in rows if r['status']=='PASS'],'topology':topo,'policy':'One current OSM source family for Hotan parent + all current county units; no geometry repair; ODbL attribution required.'}
+          (ROOT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('=== HOTAN_OSM_SUMMARY ===');print(json.dumps(summary,ensure_ascii=False,indent=2));print('=== END ===')
           PY
       - name: Package
-        run: tar -czf HAINAN-OFFICIAL-STANDARD-MAP-DISCOVERY-20260907.tar.gz hainan_standard_map
+        run: tar -czf HOTAN-CURRENT-OSM-GROUP-20260907.tar.gz hotan_osm
       - uses: actions/upload-artifact@v4
         with:
-          name: HAINAN-OFFICIAL-STANDARD-MAP-DISCOVERY-20260907
-          path: HAINAN-OFFICIAL-STANDARD-MAP-DISCOVERY-20260907.tar.gz
+          name: HOTAN-CURRENT-OSM-GROUP-20260907
+          path: HOTAN-CURRENT-OSM-GROUP-20260907.tar.gz
           retention-days: 30
