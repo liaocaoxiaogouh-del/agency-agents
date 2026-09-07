@@ -11,58 +11,59 @@ permissions:
 jobs:
   qa:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout runner repository
         uses: actions/checkout@v4
 
-      - name: Checkout locked ChinaGeoJson snapshot
+      - name: Checkout locked ChinaGeoJson reference snapshot
         shell: bash
         run: |
           set -euo pipefail
-          git clone --filter=blob:none https://github.com/zhChuXiao/ChinaGeoJson.git source
-          git -C source checkout 7aa2c5fabc6a892015625898c3482874b233f9de
-          test "$(git -C source rev-parse HEAD)" = "7aa2c5fabc6a892015625898c3482874b233f9de"
+          git clone --filter=blob:none https://github.com/zhChuXiao/ChinaGeoJson.git reference_repo
+          git -C reference_repo checkout 7aa2c5fabc6a892015625898c3482874b233f9de
+          test "$(git -C reference_repo rev-parse HEAD)" = "7aa2c5fabc6a892015625898c3482874b233f9de"
 
       - name: Install geometry validator
         run: python -m pip install --disable-pip-version-check --quiet shapely
 
-      - name: Run nationwide internal QA and normalize assets
+      - name: Acquire direct DataV base assets and run nationwide QA
         shell: bash
         run: |
           set -euo pipefail
-          cat > tea_map_spatial_qa.py <<'PY'
+          cat > tea_map_spatial_qa_v2.py <<'PY'
           import csv
           import hashlib
           import json
           import math
-          import os
-          import sys
-          from collections import Counter, defaultdict
+          import time
+          import urllib.request
+          import urllib.error
+          from collections import Counter
+          from concurrent.futures import ThreadPoolExecutor, as_completed
           from pathlib import Path
-          from shapely.geometry import shape
+
+          from shapely.geometry import Point, shape
           from shapely.validation import explain_validity
 
-          COMMIT = "7aa2c5fabc6a892015625898c3482874b233f9de"
-          ROOT = Path("source")
-          QA = Path("qa")
-          NORM = Path("normalized")
-          QA.mkdir(exist_ok=True)
-          NORM.mkdir(exist_ok=True)
+          REFERENCE_COMMIT = "7aa2c5fabc6a892015625898c3482874b233f9de"
+          REFERENCE_INFO = Path("reference_repo/info.json")
+          BASE_URL = "https://geo.datav.aliyun.com/areas_v3/bound/"
+          CURRENT_INFO_URL = BASE_URL + "infos.json"
+          SOURCE_ID = "SRC-DATAV-V3-DIRECT-SNAPSHOT-20260907"
+          BATCH_ID = "QA-20260907-DATAV-V3-DIRECT-ADM-DEFAULT-CANDIDATE"
+          RAW = Path("raw_direct")
+          NORM = Path("normalized_pass")
+          QA = Path("qa_v2")
+          for p in (RAW, NORM, QA):
+              p.mkdir(parents=True, exist_ok=True)
 
-          details = []
-          parse_errors = []
-          hard_fail_reasons = []
-          warnings = []
-          candidates = defaultdict(list)
-          source_files = []
+          def sha256_bytes(data):
+              return hashlib.sha256(data).hexdigest()
 
-          def sha256_bytes(b):
-              return hashlib.sha256(b).hexdigest()
-
-          def sha256_file(p):
+          def sha256_file(path):
               h = hashlib.sha256()
-              with open(p, "rb") as f:
+              with open(path, "rb") as f:
                   for chunk in iter(lambda: f.read(1024 * 1024), b""):
                       h.update(chunk)
               return h.hexdigest()
@@ -70,24 +71,105 @@ jobs:
           def canonical_hash(obj):
               return sha256_bytes(json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
-          def add_detail(severity, code, source_file, adcode=None, name=None, message=""):
-              details.append({
+          def http_get_bytes(url, retries=4, timeout=25):
+              last = None
+              headers = {"User-Agent": "Mozilla/5.0 TeaMapSpatialQA/1.0"}
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          if getattr(r, "status", 200) != 200:
+                              raise RuntimeError(f"HTTP {getattr(r, 'status', None)}")
+                          return r.read()
+                  except Exception as e:
+                      last = e
+                      time.sleep(0.35 * (attempt + 1))
+              raise last
+
+          reference = json.load(open(REFERENCE_INFO, encoding="utf-8"))
+          expected = {}
+          for code, rec in reference.items():
+              code = str(code)
+              if not isinstance(rec, dict) or rec.get("adcode") is None:
+                  continue
+              parent = rec.get("parent") or {}
+              expected[code] = {
+                  "adcode": code,
+                  "name": rec.get("name"),
+                  "level": rec.get("level"),
+                  "parent_adcode": None if parent.get("adcode") is None else str(parent.get("adcode")),
+                  "center": rec.get("center"),
+                  "centroid": rec.get("centroid"),
+              }
+
+          expected_counts = Counter(v["level"] for v in expected.values())
+          subnational_codes = sorted(c for c, v in expected.items() if v["level"] in {"province", "city", "district"})
+
+          # Archive current DataV metadata independently, then compare with locked reference metadata.
+          current_info_error = None
+          current_info = None
+          try:
+              b = http_get_bytes(CURRENT_INFO_URL)
+              (RAW / "infos_current.json").write_bytes(b)
+              current_info = json.loads(b.decode("utf-8"))
+          except Exception as e:
+              current_info_error = repr(e)
+
+          drift_rows = []
+          if isinstance(current_info, dict):
+              current_codes = set(map(str, current_info.keys()))
+              reference_codes = set(expected.keys())
+              for code in sorted(reference_codes | current_codes):
+                  r = expected.get(code)
+                  c = current_info.get(code) or current_info.get(int(code)) if code.isdigit() else current_info.get(code)
+                  if isinstance(c, dict):
+                      cp = c.get("parent") or {}
+                      cm = (c.get("name"), c.get("level"), None if cp.get("adcode") is None else str(cp.get("adcode")))
+                  else:
+                      cm = None
+                  if r:
+                      rm = (r.get("name"), r.get("level"), r.get("parent_adcode"))
+                  else:
+                      rm = None
+                  if rm != cm:
+                      drift_rows.append({"adcode": code, "reference": json.dumps(rm, ensure_ascii=False), "current": json.dumps(cm, ensure_ascii=False)})
+
+          download_rows = []
+
+          def acquire(code):
+              url = BASE_URL + code + ".json"
+              p = RAW / f"{code}.json"
+              try:
+                  data = http_get_bytes(url)
+                  p.write_bytes(data)
+                  return {"adcode": code, "status": "OK", "bytes": len(data), "sha256": sha256_bytes(data), "url": url, "error": ""}
+              except Exception as e:
+                  return {"adcode": code, "status": "FAIL", "bytes": 0, "sha256": "", "url": url, "error": repr(e)}
+
+          # Include country file only as archived reference; it is never a production DEFAULT asset.
+          all_download_codes = ["100000"] + subnational_codes
+          with ThreadPoolExecutor(max_workers=12) as ex:
+              futs = {ex.submit(acquire, code): code for code in all_download_codes}
+              for i, fut in enumerate(as_completed(futs), 1):
+                  row = fut.result()
+                  download_rows.append(row)
+                  if i % 250 == 0 or i == len(all_download_codes):
+                      ok = sum(r["status"] == "OK" for r in download_rows)
+                      print(f"download {i}/{len(all_download_codes)} ok={ok}")
+
+          download_by_code = {r["adcode"]: r for r in download_rows}
+          qa_details = []
+          asset_rows = []
+          pass_geoms = {}
+
+          def add_detail(code, name, severity, issue_code, message):
+              qa_details.append({
+                  "adcode": code,
+                  "name": name or "",
                   "severity": severity,
-                  "code": code,
-                  "source_file": str(source_file),
-                  "adcode": "" if adcode is None else str(adcode),
-                  "name": "" if name is None else str(name),
+                  "issue_code": issue_code,
                   "message": message,
               })
-
-          def read_json(p):
-              try:
-                  with open(p, "r", encoding="utf-8-sig") as f:
-                      return json.load(f)
-              except Exception as e:
-                  parse_errors.append((str(p), repr(e)))
-                  add_detail("FAIL", "JSON_PARSE", p, message=repr(e))
-                  return None
 
           def iter_numbers(coords):
               if isinstance(coords, (list, tuple)):
@@ -97,334 +179,240 @@ jobs:
                       for x in coords:
                           yield from iter_numbers(x)
 
-          def geometry_checks(geom, p, adcode, name):
-              issues = []
-              if not isinstance(geom, dict):
-                  issues.append(("FAIL", "GEOM_MISSING", "geometry is missing or not an object"))
-                  return issues
-              gtype = geom.get("type")
-              if gtype not in {"Polygon", "MultiPolygon"}:
-                  issues.append(("FAIL", "GEOM_TYPE", f"unexpected geometry type: {gtype}"))
-              coords = geom.get("coordinates")
-              if not coords:
-                  issues.append(("FAIL", "GEOM_EMPTY", "coordinates are empty"))
-                  return issues
-              bad_range = 0
-              nonfinite = 0
-              point_count = 0
-              for lon, lat in iter_numbers(coords):
-                  point_count += 1
-                  if not (math.isfinite(lon) and math.isfinite(lat)):
-                      nonfinite += 1
-                  elif not (-180 <= lon <= 180 and -90 <= lat <= 90):
-                      bad_range += 1
-              if point_count == 0:
-                  issues.append(("FAIL", "GEOM_NO_POINTS", "no numeric coordinate pairs found"))
-              if nonfinite:
-                  issues.append(("FAIL", "GEOM_NONFINITE", f"non-finite coordinate pairs: {nonfinite}"))
-              if bad_range:
-                  issues.append(("FAIL", "GEOM_RANGE", f"out-of-range coordinate pairs: {bad_range}"))
-              try:
-                  sg = shape(geom)
-                  if sg.is_empty:
-                      issues.append(("FAIL", "GEOM_SHAPELY_EMPTY", "Shapely geometry is empty"))
-                  if not sg.is_valid:
-                      issues.append(("FAIL", "GEOM_INVALID", explain_validity(sg)))
-              except Exception as e:
-                  issues.append(("FAIL", "GEOM_SHAPELY_ERROR", repr(e)))
-              return issues
+          for code in subnational_codes:
+              meta = expected[code]
+              name = meta["name"]
+              hard = []
+              warns = []
+              drow = download_by_code.get(code)
+              feature = None
+              geom = None
+              source_sha = drow.get("sha256", "") if drow else ""
+              source_bytes = drow.get("bytes", 0) if drow else 0
 
-          def feature_meta(feature):
-              props = feature.get("properties") or {}
-              adcode = props.get("adcode")
-              name = props.get("name")
-              level = props.get("level")
-              parent = props.get("parent")
-              parent_adcode = parent.get("adcode") if isinstance(parent, dict) else None
-              return props, adcode, name, level, parent_adcode
+              if not drow or drow["status"] != "OK":
+                  hard.append(("DOWNLOAD_FAIL", drow.get("error", "missing download result") if drow else "missing download result"))
+              else:
+                  p = RAW / f"{code}.json"
+                  try:
+                      obj = json.loads(p.read_text(encoding="utf-8-sig"))
+                  except Exception as e:
+                      obj = None
+                      hard.append(("JSON_PARSE", repr(e)))
+                  if isinstance(obj, dict):
+                      feats = obj.get("features")
+                      if obj.get("type") != "FeatureCollection" or not isinstance(feats, list) or not feats:
+                          hard.append(("NOT_FEATURE_COLLECTION", "expected non-empty FeatureCollection"))
+                      else:
+                          matches = [f for f in feats if str((f.get("properties") or {}).get("adcode")) == code]
+                          if len(matches) == 1:
+                              feature = matches[0]
+                          elif len(feats) == 1:
+                              feature = feats[0]
+                              hard.append(("ADCODE_RESPONSE_MISMATCH", f"response adcode={(feature.get('properties') or {}).get('adcode')}"))
+                          elif len(matches) == 0:
+                              hard.append(("ADCODE_NOT_FOUND_IN_RESPONSE", f"feature_count={len(feats)}"))
+                          else:
+                              hard.append(("DUPLICATE_ADCODE_IN_RESPONSE", f"matching_feature_count={len(matches)}"))
 
-          def process_collection(p, category, priority_fn):
-              obj = read_json(p)
-              if obj is None:
-                  return
-              source_files.append(p)
-              if obj.get("type") != "FeatureCollection" or not isinstance(obj.get("features"), list):
-                  add_detail("FAIL", "NOT_FEATURE_COLLECTION", p, message="expected FeatureCollection with features[]")
-                  hard_fail_reasons.append(f"invalid FeatureCollection: {p}")
-                  return
-              feats = obj["features"]
-              adcodes = []
-              for idx, feat in enumerate(feats):
-                  props, adcode, name, level, parent_adcode = feature_meta(feat)
-                  if adcode is None:
-                      add_detail("FAIL", "MISSING_ADCODE", p, name=name, message=f"feature index {idx}")
+              if feature is not None:
+                  props = feature.get("properties") or {}
+                  actual_name = props.get("name")
+                  actual_level = props.get("level")
+                  par = props.get("parent") or {}
+                  actual_parent = None if par.get("adcode") is None else str(par.get("adcode"))
+                  if str(props.get("adcode")) != code:
+                      hard.append(("ADCODE_MISMATCH", f"actual={props.get('adcode')}"))
+                  if actual_name != name:
+                      hard.append(("NAME_MISMATCH", f"expected={name}; actual={actual_name}"))
+                  if actual_level != meta["level"]:
+                      hard.append(("LEVEL_MISMATCH", f"expected={meta['level']}; actual={actual_level}"))
+                  if actual_parent != meta["parent_adcode"]:
+                      hard.append(("PARENT_MISMATCH", f"expected={meta['parent_adcode']}; actual={actual_parent}"))
+
+                  geom = feature.get("geometry")
+                  if not isinstance(geom, dict):
+                      hard.append(("GEOM_MISSING", "geometry missing"))
                   else:
-                      adcodes.append(str(adcode))
-                  if not name:
-                      add_detail("FAIL", "MISSING_NAME", p, adcode=adcode, message=f"feature index {idx}")
-                  if level not in {"province", "city", "district"}:
-                      add_detail("WARN", "UNEXPECTED_LEVEL", p, adcode=adcode, name=name, message=f"level={level}")
-                  for sev, code, msg in geometry_checks(feat.get("geometry"), p, adcode, name):
-                      add_detail(sev, code, p, adcode=adcode, name=name, message=msg)
-                  if adcode is None or not name or not isinstance(feat.get("geometry"), dict):
-                      continue
-                  priority = priority_fn(feat, feats, p)
-                  if priority is None:
-                      continue
-                  raw_bytes_sha = sha256_file(p)
-                  geom_hash = canonical_hash(feat["geometry"])
-                  candidates[str(adcode)].append({
-                      "adcode": str(adcode),
-                      "name": name,
-                      "level": level,
-                      "parent_adcode": None if parent_adcode is None else str(parent_adcode),
-                      "feature": feat,
-                      "source_file": str(p.relative_to(ROOT)),
-                      "source_sha256": raw_bytes_sha,
-                      "geometry_sha256": geom_hash,
-                      "priority": priority,
-                      "category": category,
-                  })
-              dupes = [k for k, v in Counter(adcodes).items() if v > 1]
-              for d in dupes:
-                  add_detail("FAIL", "DUPLICATE_ADCODE_IN_FILE", p, adcode=d, message="duplicate adcode in same FeatureCollection")
+                      gtype = geom.get("type")
+                      if gtype not in {"Polygon", "MultiPolygon"}:
+                          hard.append(("GEOM_TYPE", f"actual={gtype}"))
+                      coords = geom.get("coordinates")
+                      if not coords:
+                          hard.append(("GEOM_EMPTY", "coordinates empty"))
+                      else:
+                          points = 0
+                          bad_range = 0
+                          nonfinite = 0
+                          for lon, lat in iter_numbers(coords):
+                              points += 1
+                              if not (math.isfinite(lon) and math.isfinite(lat)):
+                                  nonfinite += 1
+                              elif not (-180 <= lon <= 180 and -90 <= lat <= 90):
+                                  bad_range += 1
+                          if points == 0:
+                              hard.append(("GEOM_NO_POINTS", "no coordinate pairs"))
+                          if nonfinite:
+                              hard.append(("GEOM_NONFINITE", f"count={nonfinite}"))
+                          if bad_range:
+                              hard.append(("GEOM_RANGE", f"count={bad_range}"))
+                          try:
+                              sg = shape(geom)
+                              if sg.is_empty:
+                                  hard.append(("GEOM_SHAPELY_EMPTY", "empty geometry"))
+                              if not sg.is_valid:
+                                  hard.append(("GEOM_INVALID", explain_validity(sg)))
+                          except Exception as e:
+                              hard.append(("GEOM_SHAPELY_ERROR", repr(e)))
 
-          # Required repository structure
-          required = [ROOT / "china.json", ROOT / "info.json", ROOT / "province", ROOT / "citys", ROOT / "county"]
-          for p in required:
-              if not p.exists():
-                  hard_fail_reasons.append(f"missing required path: {p}")
-                  add_detail("FAIL", "MISSING_REQUIRED_PATH", p, message="required repository path absent")
+              for issue_code, msg in hard:
+                  add_detail(code, name, "FAIL", issue_code, msg)
+              for issue_code, msg in warns:
+                  add_detail(code, name, "WARN", issue_code, msg)
 
-          # Source counts
-          province_files = sorted((ROOT / "province").glob("*.json")) if (ROOT / "province").exists() else []
-          city_files = sorted((ROOT / "citys").glob("*.json")) if (ROOT / "citys").exists() else []
-          county_files = sorted((ROOT / "county").glob("*.json")) if (ROOT / "county").exists() else []
-
-          # China -> province candidates
-          process_collection(
-              ROOT / "china.json", "china",
-              lambda feat, feats, p: 100 if (feat.get("properties") or {}).get("level") == "province" else 60,
-          )
-
-          # Province collections -> city or direct-district candidates
-          for p in province_files:
-              def pri_province(feat, feats, pth):
-                  level = (feat.get("properties") or {}).get("level")
-                  if level == "city": return 90
-                  if level == "district": return 45
-                  return 30
-              process_collection(p, "province", pri_province)
-
-          # City collections -> county/district or self candidates
-          for p in city_files:
-              stem = p.stem
-              def pri_city(feat, feats, pth, stem=stem):
-                  props = feat.get("properties") or {}
-                  level = props.get("level")
-                  name = props.get("name")
-                  if len(feats) == 1 and name == stem:
-                      if level == "district": return 95
-                      if level == "city": return 95
-                  if level == "district": return 80
-                  if level == "city": return 85
-                  return 40
-              process_collection(p, "citys", pri_city)
-
-          # County self files get highest county detail precedence
-          for p in county_files:
-              stem = p.stem
-              def pri_county(feat, feats, pth, stem=stem):
-                  props = feat.get("properties") or {}
-                  level = props.get("level")
-                  name = props.get("name")
-                  if len(feats) == 1 and name == stem:
-                      return 110
-                  if level == "district": return 105
-                  return 70
-              process_collection(p, "county", pri_county)
-
-          # Collect info.json reference metadata generically
-          info_obj = read_json(ROOT / "info.json")
-          info_records = {}
-          def walk_info(x, inherited_parent=None):
-              if isinstance(x, dict):
-                  ad = x.get("adcode")
-                  nm = x.get("name")
-                  lvl = x.get("level")
-                  par = x.get("parent")
-                  parent_ad = par.get("adcode") if isinstance(par, dict) else inherited_parent
-                  if ad is not None and nm:
-                      info_records[str(ad)] = {
-                          "name": nm,
-                          "level": lvl,
-                          "parent_adcode": None if parent_ad is None else str(parent_ad),
-                      }
-                      inherited_parent = str(ad)
-                  for k, v in x.items():
-                      if k != "parent":
-                          walk_info(v, inherited_parent)
-              elif isinstance(x, list):
-                  for v in x:
-                      walk_info(v, inherited_parent)
-          if info_obj is not None:
-              walk_info(info_obj)
-
-          # Select one production DEFAULT candidate per adcode
-          selected = {}
-          unresolved_conflicts = []
-          variants = {}
-          for adcode, arr in candidates.items():
-              arr_sorted = sorted(arr, key=lambda r: (r["priority"], r["source_file"]), reverse=True)
-              top_priority = arr_sorted[0]["priority"]
-              tops = [r for r in arr_sorted if r["priority"] == top_priority]
-              top_hashes = {r["geometry_sha256"] for r in tops}
-              if len(top_hashes) > 1:
-                  unresolved_conflicts.append(adcode)
-                  add_detail("FAIL", "TOP_PRIORITY_GEOMETRY_CONFLICT", tops[0]["source_file"], adcode=adcode, name=tops[0]["name"], message=f"{len(top_hashes)} different geometries at same top priority")
-                  continue
-              chosen = tops[0]
-              selected[adcode] = chosen
-              hashes = sorted({r["geometry_sha256"] for r in arr})
-              variants[adcode] = len(hashes)
-              if len(hashes) > 1:
-                  add_detail("WARN", "SOURCE_GEOMETRY_VARIANTS", chosen["source_file"], adcode=adcode, name=chosen["name"], message=f"{len(hashes)} geometry variants across source hierarchy; deterministic precedence applied")
-
-          # Internal parent/name checks
-          parent_missing = []
-          info_missing = []
-          info_name_mismatch = []
-          for adcode, r in selected.items():
-              parent = r["parent_adcode"]
-              if r["level"] in {"city", "district"} and parent and parent != "100000" and parent not in selected:
-                  parent_missing.append(adcode)
-                  add_detail("WARN", "PARENT_ASSET_NOT_SELECTED", r["source_file"], adcode=adcode, name=r["name"], message=f"parent_adcode={parent}")
-              inf = info_records.get(adcode)
-              if inf is None:
-                  info_missing.append(adcode)
-                  add_detail("WARN", "NOT_IN_INFO_JSON", r["source_file"], adcode=adcode, name=r["name"], message="selected asset adcode absent from info.json reference")
-              elif inf.get("name") != r["name"]:
-                  info_name_mismatch.append(adcode)
-                  add_detail("WARN", "INFO_NAME_MISMATCH", r["source_file"], adcode=adcode, name=r["name"], message=f"info.json name={inf.get('name')}")
-
-          # Count selected levels
-          level_counts = Counter(r["level"] for r in selected.values())
-          if level_counts.get("province", 0) != 34:
-              hard_fail_reasons.append(f"province asset count expected 34, got {level_counts.get('province', 0)}")
-              add_detail("FAIL", "PROVINCE_COUNT", ROOT / "china.json", message=f"expected 34, got {level_counts.get('province', 0)}")
-
-          if parse_errors:
-              hard_fail_reasons.append(f"JSON parse errors: {len(parse_errors)}")
-          if unresolved_conflicts:
-              hard_fail_reasons.append(f"unresolved top-priority geometry conflicts: {len(unresolved_conflicts)}")
-          fail_details = [d for d in details if d["severity"] == "FAIL"]
-          geom_fail_details = [d for d in fail_details if d["code"].startswith("GEOM_")]
-          if geom_fail_details:
-              hard_fail_reasons.append(f"geometry hard failures: {len(geom_fail_details)}")
-
-          # Emit normalized single-feature assets
-          index_rows = []
-          for adcode, r in sorted(selected.items()):
-              feat = r["feature"]
-              original_props = feat.get("properties") or {}
-              asset_id = f"ADM-{adcode}"
-              norm_props = {
-                  "asset_id": asset_id,
-                  "adcode": int(adcode) if adcode.isdigit() else adcode,
-                  "name": r["name"],
-                  "level": r["level"],
-                  "parent_adcode": int(r["parent_adcode"]) if r["parent_adcode"] and r["parent_adcode"].isdigit() else r["parent_adcode"],
-                  "source_id": "SRC-GITHUB-DATAV-CHINAGEOJSON",
-                  "source_repository": "zhChuXiao/ChinaGeoJson",
-                  "source_commit": COMMIT,
-                  "source_file": r["source_file"],
-                  "source_sha256": r["source_sha256"],
-                  "geometry_sha256": r["geometry_sha256"],
-                  "source_priority": r["priority"],
-                  "source_geometry_variant_count": variants.get(adcode, 1),
-                  "default_role": "DEFAULT_CANDIDATE",
-                  "original_properties": original_props,
+              status = "PASS" if not hard else "FAIL"
+              row = {
+                  "asset_id": f"ADM-{code}",
+                  "adcode": code,
+                  "name": name,
+                  "level": meta["level"],
+                  "parent_adcode": meta["parent_adcode"] or "",
+                  "qa_status": status,
+                  "hard_issue_count": len(hard),
+                  "warning_count": len(warns),
+                  "source_id": SOURCE_ID,
+                  "source_url": BASE_URL + code + ".json",
+                  "source_bytes": source_bytes,
+                  "source_sha256": source_sha,
+                  "geometry_sha256": canonical_hash(geom) if isinstance(geom, dict) else "",
+                  "geometry_type": geom.get("type") if isinstance(geom, dict) else "",
+                  "normalized_sha256": "",
               }
-              out = {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": norm_props, "geometry": feat["geometry"]}]}
-              out_path = NORM / f"{asset_id}.geojson"
-              text = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
-              out_path.write_text(text, encoding="utf-8")
-              sg = shape(feat["geometry"])
-              minx, miny, maxx, maxy = sg.bounds
-              asset_status = "WARN" if any(d["adcode"] == adcode and d["severity"] == "WARN" for d in details) else "PASS"
-              index_rows.append({
-                  "asset_id": asset_id,
-                  "adcode": adcode,
-                  "name": r["name"],
-                  "level": r["level"],
-                  "parent_adcode": r["parent_adcode"] or "",
-                  "source_file": r["source_file"],
-                  "source_sha256": r["source_sha256"],
-                  "geometry_sha256": r["geometry_sha256"],
-                  "normalized_sha256": sha256_file(out_path),
-                  "geometry_type": feat["geometry"].get("type"),
-                  "minx": minx,
-                  "miny": miny,
-                  "maxx": maxx,
-                  "maxy": maxy,
-                  "source_variant_count": variants.get(adcode, 1),
-                  "qa_status": asset_status,
-              })
 
+              if status == "PASS" and feature is not None and geom is not None:
+                  sg = shape(geom)
+                  pass_geoms[code] = sg
+                  norm = {
+                      "type": "FeatureCollection",
+                      "features": [{
+                          "type": "Feature",
+                          "properties": {
+                              "asset_id": f"ADM-{code}",
+                              "adcode": int(code),
+                              "name": name,
+                              "level": meta["level"],
+                              "parent_adcode": int(meta["parent_adcode"]) if meta["parent_adcode"] and meta["parent_adcode"].isdigit() else meta["parent_adcode"],
+                              "source_id": SOURCE_ID,
+                              "source_url": BASE_URL + code + ".json",
+                              "source_sha256": source_sha,
+                              "geometry_sha256": canonical_hash(geom),
+                              "reference_repository": "zhChuXiao/ChinaGeoJson",
+                              "reference_commit": REFERENCE_COMMIT,
+                              "default_role": "ACTIVE_DEFAULT_CANDIDATE",
+                              "original_properties": feature.get("properties") or {},
+                          },
+                          "geometry": geom,
+                      }],
+                  }
+                  out = NORM / f"ADM-{code}.geojson"
+                  out.write_text(json.dumps(norm, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+                  row["normalized_sha256"] = sha256_file(out)
+              asset_rows.append(row)
+
+          # Non-blocking internal relationship diagnostic: official center point should intersect a valid PASS parent.
+          row_by_code = {r["adcode"]: r for r in asset_rows}
+          for code in subnational_codes:
+              meta = expected[code]
+              parent = meta["parent_adcode"]
+              if not parent or parent == "100000":
+                  continue
+              if code not in pass_geoms or parent not in pass_geoms:
+                  continue
+              center = meta.get("center")
+              if isinstance(center, list) and len(center) >= 2:
+                  try:
+                      pt = Point(float(center[0]), float(center[1]))
+                      if not pass_geoms[parent].covers(pt):
+                          add_detail(code, meta["name"], "WARN", "CENTER_OUTSIDE_PARENT", f"center={center}; parent={parent}")
+                          row_by_code[code]["warning_count"] = int(row_by_code[code]["warning_count"]) + 1
+                  except Exception as e:
+                      add_detail(code, meta["name"], "WARN", "CENTER_PARENT_CHECK_ERROR", repr(e))
+                      row_by_code[code]["warning_count"] = int(row_by_code[code]["warning_count"]) + 1
+
+          # Reports
+          fields = ["asset_id","adcode","name","level","parent_adcode","qa_status","hard_issue_count","warning_count","source_id","source_url","source_bytes","source_sha256","geometry_sha256","geometry_type","normalized_sha256"]
           with open(QA / "asset_index.csv", "w", encoding="utf-8-sig", newline="") as f:
-              fields = list(index_rows[0].keys()) if index_rows else ["asset_id"]
-              w = csv.DictWriter(f, fieldnames=fields)
-              w.writeheader(); w.writerows(index_rows)
+              w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(asset_rows)
 
           with open(QA / "qa_details.csv", "w", encoding="utf-8-sig", newline="") as f:
-              fields = ["severity", "code", "source_file", "adcode", "name", "message"]
-              w = csv.DictWriter(f, fieldnames=fields)
-              w.writeheader(); w.writerows(details)
+              fields2 = ["adcode","name","severity","issue_code","message"]
+              w = csv.DictWriter(f, fieldnames=fields2); w.writeheader(); w.writerows(qa_details)
 
-          # Full source SHA256 manifest
-          manifest_paths = [ROOT / "china.json", ROOT / "info.json"] + province_files + city_files + county_files
+          with open(QA / "download_manifest.csv", "w", encoding="utf-8-sig", newline="") as f:
+              fields3 = ["adcode","status","bytes","sha256","url","error"]
+              w = csv.DictWriter(f, fieldnames=fields3); w.writeheader(); w.writerows(sorted(download_rows, key=lambda r:r["adcode"]))
+
+          with open(QA / "metadata_drift.csv", "w", encoding="utf-8-sig", newline="") as f:
+              fields4 = ["adcode","reference","current"]
+              w = csv.DictWriter(f, fieldnames=fields4); w.writeheader(); w.writerows(drift_rows)
+
           with open(QA / "source_sha256_manifest.txt", "w", encoding="utf-8") as f:
-              for p in manifest_paths:
-                  if p.exists() and p.is_file():
-                      f.write(f"{sha256_file(p)}  {p.relative_to(ROOT)}\n")
+              for p in sorted(RAW.glob("*.json")):
+                  f.write(f"{sha256_file(p)}  {p.name}\n")
 
-          selected_pass = sum(1 for r in index_rows if r["qa_status"] == "PASS")
-          selected_warn = sum(1 for r in index_rows if r["qa_status"] == "WARN")
-          overall = "FAIL" if hard_fail_reasons else ("PASS_WITH_WARNINGS" if selected_warn or warnings or any(d["severity"] == "WARN" for d in details) else "PASS")
+          pass_rows = [r for r in asset_rows if r["qa_status"] == "PASS"]
+          fail_rows = [r for r in asset_rows if r["qa_status"] == "FAIL"]
+          with open(QA / "lock_manifest.csv", "w", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(pass_rows)
+          with open(QA / "exception_manifest.csv", "w", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(fail_rows)
+
+          pass_counts = Counter(r["level"] for r in pass_rows)
+          fail_counts = Counter(r["level"] for r in fail_rows)
+          fail_issue_counts = Counter(d["issue_code"] for d in qa_details if d["severity"] == "FAIL")
+          warning_issue_counts = Counter(d["issue_code"] for d in qa_details if d["severity"] == "WARN")
+          downloaded_ok = sum(r["status"] == "OK" for r in download_rows if r["adcode"] != "100000")
+          fatal = []
+          if len(subnational_codes) != 3237:
+              fatal.append(f"reference subnational count expected 3237, got {len(subnational_codes)}")
+          if downloaded_ok < int(len(subnational_codes) * 0.95):
+              fatal.append(f"download success below 95%: {downloaded_ok}/{len(subnational_codes)}")
+          if expected_counts.get("province") != 34:
+              fatal.append(f"reference province count expected 34, got {expected_counts.get('province')}")
+
+          overall = "STRUCTURAL_FAIL" if fatal else ("PASS_WITH_EXCEPTIONS" if fail_rows else "PASS")
           summary = {
-              "batch_id": "QA-20260907-DATAV-V3-ADM-DEFAULT-CANDIDATE",
-              "source_repository": "zhChuXiao/ChinaGeoJson",
-              "source_commit": COMMIT,
-              "policy": "internal QA only; cross-source boundary differences do not fail the whole DEFAULT library",
-              "china_json_role": "reference only; not approved as formal national-standard China map",
-              "licensing_note": "Repository is MIT-licensed, but upstream DataV data rights must be reviewed separately before relying on this as a commercial redistribution license.",
-              "source_file_counts": {
-                  "province_files": len(province_files),
-                  "city_files": len(city_files),
-                  "county_files": len(county_files),
-                  "total_geometry_files_plus_china": 1 + len(province_files) + len(city_files) + len(county_files),
-              },
-              "normalized_asset_counts": dict(level_counts),
-              "normalized_total": len(index_rows),
-              "asset_status_counts": {"PASS": selected_pass, "WARN": selected_warn},
-              "qa_detail_counts": dict(Counter(d["severity"] for d in details)),
-              "parse_error_count": len(parse_errors),
-              "geometry_fail_count": len(geom_fail_details),
-              "unresolved_top_priority_conflicts": len(unresolved_conflicts),
-              "parent_missing_count": len(parent_missing),
-              "info_missing_count": len(info_missing),
-              "info_name_mismatch_count": len(info_name_mismatch),
+              "batch_id": BATCH_ID,
+              "source_id": SOURCE_ID,
+              "source_base_url": BASE_URL,
+              "reference_repository": "zhChuXiao/ChinaGeoJson",
+              "reference_commit": REFERENCE_COMMIT,
+              "policy": "Direct DataV base geometry per adcode. No geometry repair. Invalid/missing assets go to exception queue; cross-source differences do not fail the library.",
+              "country_100000_role": "archived reference only; never formal national-standard China map",
+              "reference_expected_counts": dict(expected_counts),
+              "subnational_expected_total": len(subnational_codes),
+              "download_success_subnational": downloaded_ok,
+              "pass_total": len(pass_rows),
+              "fail_total": len(fail_rows),
+              "pass_by_level": dict(pass_counts),
+              "fail_by_level": dict(fail_counts),
+              "fail_issue_counts": dict(fail_issue_counts),
+              "warning_issue_counts": dict(warning_issue_counts),
+              "metadata_drift_count_vs_locked_reference": len(drift_rows),
+              "current_info_download_error": current_info_error,
               "overall_status": overall,
-              "hard_fail_reasons": hard_fail_reasons,
+              "fatal_reasons": fatal,
+              "lock_policy": "PASS assets may become ACTIVE DEFAULT; FAIL assets remain unlocked and require OVERRIDE or later replacement; ACTIVE OVERRIDE always wins.",
+              "licensing_note": "Repository code is MIT-licensed; DataV upstream data usage/redistribution rights are a separate review item and are not inferred from the repository license.",
           }
           (QA / "qa_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-          print("=== TEA_MAP_QA_SUMMARY ===")
+          print("=== TEA_MAP_QA_V2_SUMMARY ===")
           print(json.dumps(summary, ensure_ascii=False, indent=2))
-          print("=== END_TEA_MAP_QA_SUMMARY ===")
-          if overall == "FAIL":
-              sys.exit(2)
+          print("=== END_TEA_MAP_QA_V2_SUMMARY ===")
+          if fatal:
+              raise SystemExit(2)
           PY
-          python tea_map_spatial_qa.py
+          python tea_map_spatial_qa_v2.py
 
       - name: Build archive packages
         if: always()
@@ -432,38 +420,36 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p bundles
-          tar --exclude='.git' -czf bundles/RAW_ChinaGeoJson_7aa2c5fabc6a.tar.gz -C source .
-          tar -czf bundles/QA_DATAV_V3_ADM_20260907.tar.gz qa 2>/dev/null || true
-          if [ -d normalized ]; then
-            tar -czf bundles/NORMALIZED_ADM_DATAV_V3_20260907.tar.gz normalized
-          fi
-          sha256sum bundles/* > bundles/BUNDLE_SHA256_MANIFEST.txt || true
+          if [ -d raw_direct ]; then tar -czf bundles/RAW_DATAV_V3_DIRECT_20260907.tar.gz raw_direct; fi
+          if [ -d qa_v2 ]; then tar -czf bundles/QA_DATAV_V3_DIRECT_20260907.tar.gz qa_v2; fi
+          if [ -d normalized_pass ]; then tar -czf bundles/NORMALIZED_PASS_ADM_DATAV_V3_20260907.tar.gz normalized_pass; fi
+          sha256sum bundles/*.tar.gz > bundles/BUNDLE_SHA256_MANIFEST.txt 2>/dev/null || true
           cat bundles/BUNDLE_SHA256_MANIFEST.txt || true
 
-      - name: Upload RAW snapshot
+      - name: Upload direct RAW snapshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: RAW-DataV-V3-7aa2c5f
-          path: bundles/RAW_ChinaGeoJson_7aa2c5fabc6a.tar.gz
-          if-no-files-found: error
+          name: RAW-DataV-V3-DIRECT-20260907
+          path: bundles/RAW_DATAV_V3_DIRECT_20260907.tar.gz
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Upload QA results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: QA-DataV-V3-ADM-20260907
-          path: bundles/QA_DATAV_V3_ADM_20260907.tar.gz
+          name: QA-DataV-V3-DIRECT-ADM-20260907
+          path: bundles/QA_DATAV_V3_DIRECT_20260907.tar.gz
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Upload normalized assets
+      - name: Upload normalized PASS assets
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: NORMALIZED-ADM-DataV-V3-20260907
-          path: bundles/NORMALIZED_ADM_DATAV_V3_20260907.tar.gz
+          name: NORMALIZED-PASS-ADM-DataV-V3-20260907
+          path: bundles/NORMALIZED_PASS_ADM_DATAV_V3_20260907.tar.gz
           if-no-files-found: warn
           retention-days: 30
 
@@ -471,7 +457,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MANIFEST-DataV-V3-ADM-20260907
+          name: MANIFEST-DataV-V3-DIRECT-ADM-20260907
           path: bundles/BUNDLE_SHA256_MANIFEST.txt
           if-no-files-found: warn
           retention-days: 30
